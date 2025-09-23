@@ -4,6 +4,22 @@
 
 #define LED PA8
 
+#define R8_NFC_CMD  (*(vu8*)0x4000E000)
+#define R8_NFC_001  (*(vu16*)0x4000E001)
+#define R32_NFC_014 (*(vu32*)0x4000E014)
+
+#define BSS_PCD_END_CB                (*(vu32*)0x200000EC)
+#define BSS_PCD_DATA_BUF              (*(vu32*)0x200000F0)
+#define BSS_PCD_SEND_BUF              (*(vu32*)0x200000F4)
+#define BSS_PCD_RECV_BUF              (*(vu32*)0x200000F8)
+#define BSS_PCD_PARITY_BUF            (*(vu32*)0x200000FC)
+#define BSS_PCD_DATA_BUF_SIZE         (*(vu32*)0x20000100)
+#define BSS_PCD_SEND_BUF_SIZE         (*(vu32*)0x20000102)
+#define BSS_PCD_RECV_BUF_SIZE         (*(vu32*)0x20000104)
+#define BSS_PCD_PARITY_BUF_SIZE       (*(vu32*)0x20000106)
+
+#define BSS_NFC_COMM_STATUS           (*(vu32*)0x2000011C)
+
 #define NFCA_PCD_DATA_BUF_SIZE                   32
 #define NFCA_PCD_MAX_SEND_NUM                    (NFCA_PCD_DATA_BUF_SIZE)
 #define NFCA_PCD_MAX_RECV_NUM                    (NFCA_PCD_DATA_BUF_SIZE * 16 / 9)
@@ -35,9 +51,11 @@ __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM 
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_parity_buf[NFCA_PCD_MAX_PARITY_NUM];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
 
+extern uint32_t nfca_available;
 static uint16_t gs_lpcd_adc_base_value;
 uint16_t g_nfca_pcd_recv_buf_len;
 uint32_t g_nfca_pcd_recv_bits;
+
 
 typedef enum {
 	SampleFreq_8 = 0,
@@ -136,43 +154,40 @@ int ADC_VoltConverSignalPGA_MINUS_12dB(uint16_t adc_data) {
 
 // NFCA functions
 void nfca_pcd_init() {
-	nfca_pcd_config_t cfg;
-	uint8_t res;
-	
 	funPinMode( (PB8 | PB9 | PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 	
 	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB)<< 16);
 	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8);
+
+	BSS_PCD_END_CB = 0;
 	
-	cfg.pcd_end_cb = NULL;
+	BSS_PCD_DATA_BUF = (uint32_t)gs_nfca_pcd_data_buf;
+	BSS_PCD_SEND_BUF = (uint32_t)g_nfca_pcd_send_buf;
+	BSS_PCD_RECV_BUF = (uint32_t)g_nfca_pcd_recv_buf;
+	BSS_PCD_PARITY_BUF = (uint32_t)g_nfca_pcd_parity_buf;
 	
-	cfg.data_buf = gs_nfca_pcd_data_buf;
-	cfg.data_buf_size = NFCA_PCD_DATA_BUF_SIZE;
-	
-	cfg.send_buf = g_nfca_pcd_send_buf;
-	cfg.send_buf_size = NFCA_PCD_MAX_SEND_NUM;
-	
-	cfg.recv_buf = g_nfca_pcd_recv_buf;
-	cfg.recv_buf_size = NFCA_PCD_MAX_RECV_NUM;
-	
-	cfg.parity_buf = g_nfca_pcd_parity_buf;
-	cfg.parity_buf_size = NFCA_PCD_MAX_PARITY_NUM;
-	
-	res = nfca_pcd_lib_init(&cfg);
-	if(res) {
-		printf("nfca pcd lib init error\n");
-		while(1);
-	}
+	BSS_PCD_DATA_BUF_SIZE = NFCA_PCD_DATA_BUF_SIZE;
+	BSS_PCD_SEND_BUF_SIZE = NFCA_PCD_MAX_SEND_NUM;
+	BSS_PCD_RECV_BUF_SIZE = NFCA_PCD_MAX_RECV_NUM; 
+	BSS_PCD_PARITY_BUF_SIZE = NFCA_PCD_MAX_PARITY_NUM;
+
+	nfca_available = 1;
 }
 
 void nfca_pcd_start(void) {
-	nfca_pcd_lib_start();
+	if(nfca_available) {
+		R8_NFC_CMD = 0x24;
+		R32_NFC_014 &= 0xe7ff;
+	}
 	NVIC_ClearPendingIRQ(NFC_IRQn);
 	NVIC_EnableIRQ(NFC_IRQn);
 }
 
 void nfca_pcd_stop(void) {
-	nfca_pcd_lib_stop();
+	if(nfca_available) {
+		R8_NFC_001 = 0;
+		R8_NFC_CMD = 0;
+	}
 	NVIC_DisableIRQ(NFC_IRQn);
 }
 
@@ -231,8 +246,6 @@ void nfca_pcd_lpcd_calibration() {
 	
 	gs_lpcd_adc_base_value = adc_all >> 3;
 	
-	printf("gs_lpcd_adc_base_value:%d\n", gs_lpcd_adc_base_value);
-	
 	for(int i = 0; i < 8; i++) {
 		gs_lpcd_adc_filter_buf[i] = gs_lpcd_adc_base_value;
 	}
@@ -279,6 +292,14 @@ uint16_t nfca_adc_get_ant_signal(void) {
 	return (adc_data);
 }
 
+nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
+	if(BSS_NFC_COMM_STATUS > 2) {
+		// some more stuff is happening here, RE that
+		return BSS_NFC_COMM_STATUS;
+	}
+	return 0;
+}
+
 nfca_pcd_controller_state_t nfca_pcd_wait_communicate_end(void) {
 	nfca_pcd_controller_state_t status;
 	uint32_t overtimes;
@@ -286,7 +307,8 @@ nfca_pcd_controller_state_t nfca_pcd_wait_communicate_end(void) {
 	overtimes = 0;
 	
 	while (1) {
-		status = nfca_pcd_get_communicate_status();
+		status = nfca_pcd_get_communicate_status(); // from lib
+		// status = nfca_pcd_get_comm_status();
 		if ((status != 0) || (overtimes > (NFCA_PCD_WAIT_MAX_MS * 10))) {
 			break;
 		}
@@ -319,7 +341,6 @@ uint8_t nfca_pcd_lpcd_check(void) {
 	uint8_t res = 0;
 	
 	adc_value = nfca_adc_get_ant_signal();
-	printf("adc_value:%d\n", adc_value);
 	if(adc_value > gs_lpcd_adc_base_value) {
 		adc_value_diff = adc_value - gs_lpcd_adc_base_value;
 	}
@@ -394,8 +415,6 @@ void ISO14443ACalOddParityBit(uint8_t *data, uint8_t *out_parity, uint16_t len) 
 	}
 }
 
-
-
 // PCD functions
 uint16_t PcdRequest(uint8_t req_code) {
 	nfca_pcd_controller_state_t status;
@@ -409,26 +428,36 @@ uint16_t PcdRequest(uint8_t req_code) {
 	if((status == NFCA_PCD_CONTROLLER_STATE_DONE) || (status == NFCA_PCD_CONTROLLER_STATE_COLLISION)) {
 		if(g_nfca_pcd_recv_bits == (2 * 9)) {
 			if(ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 2)) {
-				printf("ATQA:0x%04x\r\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0]);
 				return ((uint16_t *)(g_nfca_pcd_recv_buf))[0];
 			}
 			else {
-				printf("ODD BIT ERROR\r\n");
-				printf("data:0x%02x 0x%02x\r\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0], ((uint16_t *)(g_nfca_pcd_recv_buf))[1]);
-				printf("parity:%d %d\r\n", g_nfca_pcd_parity_buf[0], g_nfca_pcd_parity_buf[1]);
+				printf("ODD BIT ERROR\n");
+				printf("data: 0x%02x 0x%02x\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0], ((uint16_t *)(g_nfca_pcd_recv_buf))[1]);
+				printf("parity: %d %d\n", g_nfca_pcd_parity_buf[0], g_nfca_pcd_parity_buf[1]);
 			}
 		}
 		else {
-			printf("BITS NUM ERROR: %ld, 0x%04x\r\n", g_nfca_pcd_recv_bits, ((uint16_t *)(g_nfca_pcd_recv_buf))[0]);
+			printf("BITS NUM ERROR: %ld, 0x%04x\n", g_nfca_pcd_recv_bits, ((uint16_t *)(g_nfca_pcd_recv_buf))[0]);
 		}
 	}
 	else {
-		printf("STATUS ERROR: %d\r\n", status);
+		printf("STATUS ERROR %d:", status);
+		switch(status) {
+		case NFCA_PCD_CONTROLLER_STATE_OVERTIME:
+			printf(" OVERTIME\n");
+			break;
+		case NFCA_PCD_CONTROLLER_STATE_ERR:
+			printf(" ERR\n");
+			break;
+		default:
+			printf(" UNKNOWN\n");
+			break;
+		}
 	}
 	
 	}
 	else {
-		printf("COMMUNICATE ERROR\r\n");
+		printf("COMMUNICATE ERROR\n");
 	}
 	
 	return 0;
@@ -460,7 +489,7 @@ uint16_t PcdAnticoll(uint8_t cmd) {
 				}
 				else {
 					res = PCD_ODD_PARITY_ERROR;
-					printf("ODD BIT ERROR\r\n");
+					printf("ODD BIT ERROR\n");
 				}
 			}
 		}
@@ -503,7 +532,7 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr)
 				}
 				else {
 					res = PCD_ODD_PARITY_ERROR;
-					printf("ODD BIT ERROR\r\n");
+					printf("ODD BIT ERROR\n");
 				}
 			}
 		}
@@ -533,29 +562,28 @@ void nfca_pcd_test() {
 	uint8_t picc_uid[7];
 
 	int vdd_value = ADC_VoltConverSignalPGA_MINUS_12dB( sys_get_vdd() );
-	printf("vdd_value: %d\n", vdd_value);
 	if(vdd_value > 3400) {
 		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL0);
-		printf("NFC DRV LVL0\n");
+		printf("NFC drive lvl0\n");
 	}
 	else if(vdd_value > 3000) {
 		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL1);
-		printf("NFC DRV LVL1\n");
+		printf("NFC drive lvl1\n");
 	}
 	else if(vdd_value > 2600) {
 		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL2);
-		printf("NFC DRV LVL2\n");
+		printf("NFC drive lvl2\n");
 	}
 	else {
 		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL3);
-		printf("NFC DRV LVL3\n");
+		printf("NFC drive lvl3\n");
 	}
 
 	while(1) {
 		nfca_pcd_start();
 
 		if(nfca_pcd_lpcd_check()) {
-			printf("CARD DETECT\n");
+			printf("* card detected\n");
 			
 			Delay_Ms(5);
 	
@@ -567,11 +595,11 @@ void nfca_pcd_test() {
 					picc_uid[1] = g_nfca_pcd_recv_buf[1];
 					picc_uid[2] = g_nfca_pcd_recv_buf[2];
 					picc_uid[3] = g_nfca_pcd_recv_buf[3];
-					printf("uid: %02x %02x %02x %02x\n", picc_uid[0], picc_uid[1], picc_uid[2], picc_uid[3]);
+					printf("Mifare Classic uid: %02x %02x %02x %02x\n", picc_uid[0], picc_uid[1], picc_uid[2], picc_uid[3]);
 	
 					res = PcdSelect(PICC_ANTICOLL1, picc_uid);
 					if (res == PCD_NO_ERROR) {
-						printf("\nselect OK, SAK:%02x\n", g_nfca_pcd_recv_buf[0]);
+						printf("select OK, SAK:%02x\n", g_nfca_pcd_recv_buf[0]);
 						PcdHalt();
 					}
 				}
@@ -592,12 +620,12 @@ void nfca_pcd_test() {
 								picc_uid[4] = g_nfca_pcd_recv_buf[1];
 								picc_uid[5] = g_nfca_pcd_recv_buf[2];
 								picc_uid[6] = g_nfca_pcd_recv_buf[3];
-								printf("uid: %02x %02x %02x %02x %02x %02x %02x\n", picc_uid[0], picc_uid[1],
-								picc_uid[2], picc_uid[3], picc_uid[4], picc_uid[5], picc_uid[6]);
+								printf("Mifare Ultralight uid: %02x %02x %02x %02x %02x %02x %02x\n", picc_uid[0], picc_uid[1],
+										picc_uid[2], picc_uid[3], picc_uid[4], picc_uid[5], picc_uid[6]);
 				
 								res = PcdSelect(PICC_ANTICOLL2, g_nfca_pcd_recv_buf);
 								if (res == PCD_NO_ERROR) {
-									printf("SELECT OK, SAK: %02x\n", g_nfca_pcd_recv_buf[0]);
+									printf("select OK, SAK: %02x\n", g_nfca_pcd_recv_buf[0]);
 									PcdHalt();
 								}
 							}
@@ -614,9 +642,9 @@ void nfca_pcd_test() {
 					}
 				}
 			}
-		}
-		else {
-			printf("NO CARD\n");
+			else {
+				printf("unknown type (ATQA: 0x%04x)\n", res);
+			}
 		}
 
 		nfca_pcd_stop();
