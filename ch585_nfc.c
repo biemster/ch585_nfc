@@ -6,7 +6,7 @@
 #define R8_NFC_CMD  (*(vu8*)0x4000E000)
 #define R16_NFC_001 (*(vu16*)0x4000E001)
 #define R16_NFC_TMR (*(vu16*)0x4000E010)
-#define R32_NFC_014 (*(vu32*)0x4000E014)
+#define R32_NFC_DRV (*(vu32*)0x4000E014)
 
 #define BSS_PCD_END_CB                (*(vu32*)0x200000EC)
 #define BSS_PCD_DATA_BUF              (*(vu32*)0x200000F0)
@@ -49,7 +49,8 @@
 #define PCD_ANTICOLL_OVER_TIME 10
 #define PCD_SELECT_OVER_TIME   10
 
-#define ISO14443A_CHECK_BCC(B) ((B[0] ^ B[1] ^ B[2] ^ B[3]) == B[4])
+#define ISO14443A_CHECK_BCC(B)    ((B[0] ^ B[1] ^ B[2] ^ B[3]) == B[4])
+#define NFCA_PCD_SET_OUT_DRV(lvl) (R32_NFC_DRV = ((R32_NFC_DRV & 0x9ff) | lvl))
 
 __attribute__((aligned(4))) static uint16_t gs_nfca_pcd_data_buf[NFCA_PCD_DATA_BUF_SIZE];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
@@ -224,7 +225,7 @@ void nfca_pcd_init() {
 void nfca_pcd_start(void) {
 	if(nfca_available) {
 		R8_NFC_CMD = 0x24;
-		R32_NFC_014 &= 0xe7ff;
+		R32_NFC_DRV &= 0xe7ff;
 	}
 	NVIC_ClearPendingIRQ(NFC_IRQn);
 	NVIC_EnableIRQ(NFC_IRQn);
@@ -257,8 +258,6 @@ void nfca_pcd_wait_us(uint32_t microseconds) {
 	
 	R16_NFC_TMR = (uint16_t)ticks;
 }
-
-extern void nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_Def drv);
 
 void nfca_pcd_lpcd_calibration() {
 	uint8_t sensor, channel, config, tkey_cfg;
@@ -685,19 +684,19 @@ void nfca_pcd_test() {
 
 	int vdd_value = ADC_VoltConverSignalPGA_MINUS_12dB( sys_get_vdd() );
 	if(vdd_value > 3400) {
-		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL0);
+		NFCA_PCD_SET_OUT_DRV(NFCA_PCD_DRV_CTRL_LEVEL0);
 		printf("NFC drive lvl0\n");
 	}
 	else if(vdd_value > 3000) {
-		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL1);
+		NFCA_PCD_SET_OUT_DRV(NFCA_PCD_DRV_CTRL_LEVEL1);
 		printf("NFC drive lvl1\n");
 	}
 	else if(vdd_value > 2600) {
-		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL2);
+		NFCA_PCD_SET_OUT_DRV(NFCA_PCD_DRV_CTRL_LEVEL2);
 		printf("NFC drive lvl2\n");
 	}
 	else {
-		nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_LEVEL3);
+		NFCA_PCD_SET_OUT_DRV(NFCA_PCD_DRV_CTRL_LEVEL3);
 		printf("NFC drive lvl3\n");
 	}
 
