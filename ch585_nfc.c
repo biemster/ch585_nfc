@@ -18,7 +18,12 @@
 #define BSS_PCD_RECV_BUF_SIZE         (*(vu32*)0x20000104)
 #define BSS_PCD_PARITY_BUF_SIZE       (*(vu32*)0x20000106)
 
-#define BSS_NFC_COMM_STATUS           (*(vu32*)0x2000011C)
+#define BSS_R16_NFC_10E               (*(vu16*)0x2000010E)
+#define BSS_R32_NFC_114               (*(vu32*)0x20000114)
+#define BSS_R8_NFC_11A                (*(vu8*)0x2000011A)
+
+#define BSS_R8_NFC_INTF_STATUS        (*(vu8*)0x2000011B)
+#define BSS_R8_NFC_COMM_STATUS        (*(vu8*)0x2000011C)
 
 #define NFCA_PCD_DATA_BUF_SIZE                   32
 #define NFCA_PCD_MAX_SEND_NUM                    (NFCA_PCD_DATA_BUF_SIZE)
@@ -292,10 +297,63 @@ uint16_t nfca_adc_get_ant_signal(void) {
 	return (adc_data);
 }
 
+uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t bss_10e, uint8_t bss_11a, uint8_t recv_buf[], uint8_t parity_buf[], uint16_t output_len) {
+	// Current position in the bitstream, combining word index and bit offset.
+	uint32_t current_total_bit_pos = bss_11a; //bit_offset;
+	uint32_t bits_remaining = bss_10e; //num_bits;
+	int32_t bytes_processed;
+	
+	// The main loop processes one output byte per iteration.
+	// This corresponds to the loop between LAB_00001068 and LAB_000010b6.
+	for (bytes_processed = 0; bytes_processed < output_len; ++bytes_processed) {
+		// Stop if there aren't enough bits left for a full 9-bit packet.
+		// The assembly checks this with 'num_bits' (bss_10e).
+		if (bits_remaining < 9) {
+			break;
+		}
+		
+		// Determine which word(s) in data_buf hold the next 9 bits.
+		uint32_t word_index = current_total_bit_pos / 16;
+		uint32_t bit_pos_in_word = current_total_bit_pos % 16;
+		
+		// Combine two consecutive 16-bit words into a 32-bit integer to safely
+		// extract 9 bits that may cross a word boundary. This is a clean C
+		// equivalent of the assembly's more complex boundary-checking logic.
+		uint32_t combined_words = data_buf[word_index];
+		if (bit_pos_in_word > (16 - 9)) {
+			// The 9-bit chunk crosses from data_buf[word_index] to data_buf[word_index + 1].
+			combined_words |= (uint32_t)data_buf[word_index + 1] << 16;
+		}
+		
+		// Shift to the correct starting bit and mask to extract the 9-bit packet.
+		// The mask 0x1FF is binary 1 1111 1111.
+		uint16_t nine_bit_packet = (combined_words >> bit_pos_in_word) & 0x1FF;
+		
+		// The lower 8 bits are the data byte.
+		// Corresponds to 'sra' and 'andi' at 0x1072-0x1076.
+		recv_buf[bytes_processed] = (uint8_t)(nine_bit_packet & 0xFF);
+		
+		// The 9th bit is the parity bit.
+		// Corresponds to the 'sbext' instruction at 0x1090.
+		parity_buf[bytes_processed] = (uint8_t)((nine_bit_packet >> 8) & 0x01);
+		
+		// Advance the bit position by 9 for the next iteration.
+		current_total_bit_pos += 9;
+		bits_remaining -= 9;
+	}
+	
+	// The function returns the number of bytes processed, which is in register a0
+	// at the end of the assembly code.
+	return bytes_processed;
+}
+
 nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
-	if(BSS_NFC_COMM_STATUS > 2) {
-		// some more stuff is happening here, RE that
-		return BSS_NFC_COMM_STATUS;
+	if(BSS_R8_NFC_COMM_STATUS > 2) {
+		if(BSS_R8_NFC_INTF_STATUS) {
+			R8_NFC_CMD &= 0xef;
+			BSS_R32_NFC_114 = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_10E, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, BSS_PCD_RECV_BUF_SIZE);	
+		}
+		return BSS_R8_NFC_COMM_STATUS;
 	}
 	return 0;
 }
@@ -307,13 +365,12 @@ nfca_pcd_controller_state_t nfca_pcd_wait_communicate_end(void) {
 	overtimes = 0;
 	
 	while (1) {
-		status = nfca_pcd_get_communicate_status(); // from lib
-		// status = nfca_pcd_get_comm_status();
+		status = nfca_pcd_get_comm_status();
 		if ((status != 0) || (overtimes > (NFCA_PCD_WAIT_MAX_MS * 10))) {
 			break;
 		}
 		
-		Delay_Ms(100);
+		Delay_Us(100);
 		overtimes++;
 	}
 	
@@ -423,38 +480,37 @@ uint16_t PcdRequest(uint8_t req_code) {
 	nfca_pcd_set_wait_us(200);
 
 	if(nfca_pcd_communicate(7, NFCA_PCD_REC_MODE_COLI, 0) == 0) {
-	status = nfca_pcd_wait_communicate_end();
-	
-	if((status == NFCA_PCD_CONTROLLER_STATE_DONE) || (status == NFCA_PCD_CONTROLLER_STATE_COLLISION)) {
-		if(g_nfca_pcd_recv_bits == (2 * 9)) {
-			if(ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 2)) {
-				return ((uint16_t *)(g_nfca_pcd_recv_buf))[0];
+		status = nfca_pcd_wait_communicate_end();
+		
+		if((status == NFCA_PCD_CONTROLLER_STATE_DONE) || (status == NFCA_PCD_CONTROLLER_STATE_COLLISION)) {
+			if(g_nfca_pcd_recv_bits == (2 * 9)) {
+				if(ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 2)) {
+					return ((uint16_t *)(g_nfca_pcd_recv_buf))[0];
+				}
+				else {
+					printf("ODD BIT ERROR\n");
+					printf("data: 0x%02x 0x%02x\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0], ((uint16_t *)(g_nfca_pcd_recv_buf))[1]);
+					printf("parity: %d %d\n", g_nfca_pcd_parity_buf[0], g_nfca_pcd_parity_buf[1]);
+				}
 			}
 			else {
-				printf("ODD BIT ERROR\n");
-				printf("data: 0x%02x 0x%02x\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0], ((uint16_t *)(g_nfca_pcd_recv_buf))[1]);
-				printf("parity: %d %d\n", g_nfca_pcd_parity_buf[0], g_nfca_pcd_parity_buf[1]);
+				printf("BITS NUM ERROR: %ld, 0x%04x\n", g_nfca_pcd_recv_bits, ((uint16_t *)(g_nfca_pcd_recv_buf))[0]);
 			}
 		}
 		else {
-			printf("BITS NUM ERROR: %ld, 0x%04x\n", g_nfca_pcd_recv_bits, ((uint16_t *)(g_nfca_pcd_recv_buf))[0]);
+			printf("STATUS ERROR %d:", status);
+			switch(status) {
+			case NFCA_PCD_CONTROLLER_STATE_OVERTIME:
+				printf(" OVERTIME\n");
+				break;
+			case NFCA_PCD_CONTROLLER_STATE_ERR:
+				printf(" ERR\n");
+				break;
+			default:
+				printf(" UNKNOWN\n");
+				break;
+			}
 		}
-	}
-	else {
-		printf("STATUS ERROR %d:", status);
-		switch(status) {
-		case NFCA_PCD_CONTROLLER_STATE_OVERTIME:
-			printf(" OVERTIME\n");
-			break;
-		case NFCA_PCD_CONTROLLER_STATE_ERR:
-			printf(" ERR\n");
-			break;
-		default:
-			printf(" UNKNOWN\n");
-			break;
-		}
-	}
-	
 	}
 	else {
 		printf("COMMUNICATE ERROR\n");
