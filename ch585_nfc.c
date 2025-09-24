@@ -1,11 +1,11 @@
 #include "ch32fun.h"
-#include "NFCA_LIB/CH58x_NFCA_LIB.h"
 #include <stdio.h>
 
 #define LED PA8
 
 #define R8_NFC_CMD  (*(vu8*)0x4000E000)
-#define R8_NFC_001  (*(vu16*)0x4000E001)
+#define R16_NFC_001 (*(vu16*)0x4000E001)
+#define R16_NFC_TMR (*(vu16*)0x4000E010)
 #define R32_NFC_014 (*(vu32*)0x4000E014)
 
 #define BSS_PCD_END_CB                (*(vu32*)0x200000EC)
@@ -18,8 +18,8 @@
 #define BSS_PCD_RECV_BUF_SIZE         (*(vu32*)0x20000104)
 #define BSS_PCD_PARITY_BUF_SIZE       (*(vu32*)0x20000106)
 
-#define BSS_R16_NFC_10E               (*(vu16*)0x2000010E)
-#define BSS_R32_NFC_114               (*(vu32*)0x20000114)
+#define BSS_R16_NFC_RECV_BITS         (*(vu16*)0x2000010E)
+#define BSS_R32_NFC_RECV_LEN          (*(vu32*)0x20000114)
 #define BSS_R8_NFC_11A                (*(vu8*)0x2000011A)
 
 #define BSS_R8_NFC_INTF_STATUS        (*(vu8*)0x2000011B)
@@ -32,6 +32,7 @@
 #define NFCA_PCD_LPCD_THRESHOLD_PERMIL           5
 #define NFCA_PCD_LPCD_THRESHOLD_MAX_LIMIT_PERMIL 20
 #define NFCA_PCD_WAIT_MAX_MS                     1000
+#define NFCA_PCD_TICKS_PER_MILLISECOND           1725
 
 #define PICC_REQALL            0x52
 #define PICC_ANTICOLL1         0x93
@@ -61,6 +62,28 @@ static uint16_t gs_lpcd_adc_base_value;
 uint16_t g_nfca_pcd_recv_buf_len;
 uint32_t g_nfca_pcd_recv_bits;
 
+typedef enum {
+	NFCA_PCD_CONTROLLER_STATE_FREE = 0,
+	NFCA_PCD_CONTROLLER_STATE_SENDING,
+	NFCA_PCD_CONTROLLER_STATE_RECEIVING,
+	NFCA_PCD_CONTROLLER_STATE_COLLISION,
+	NFCA_PCD_CONTROLLER_STATE_OVERTIME,
+	NFCA_PCD_CONTROLLER_STATE_DONE,
+	NFCA_PCD_CONTROLLER_STATE_ERR,
+} nfca_pcd_controller_state_t;
+
+typedef enum {
+	NFCA_PCD_DRV_CTRL_LEVEL0 = (0x00 << 13),
+	NFCA_PCD_DRV_CTRL_LEVEL1 = (0x01 << 13),
+	NFCA_PCD_DRV_CTRL_LEVEL2 = (0x02 << 13),
+	NFCA_PCD_DRV_CTRL_LEVEL3 = (0x03 << 13),
+} NFCA_PCD_DRV_CTRL_Def;
+
+typedef enum {
+	NFCA_PCD_REC_MODE_NONE   = 0,
+	NFCA_PCD_REC_MODE_NORMAL = 1,
+	NFCA_PCD_REC_MODE_COLI   = 0x10,
+} NFCA_PCD_REC_MODE_Def;
 
 typedef enum {
 	SampleFreq_8 = 0,
@@ -120,6 +143,25 @@ enum {
 	PICC_NAK_NOT_AUTHED       = (PICC_NAK_HEAD | NAK_NOT_AUTHED),
 	PICC_NAK_EEPROM_ERROR     = (PICC_NAK_HEAD | NAK_EEPROM_ERROR),
 	PICC_NAK_OTHER_ERROR      = (PICC_NAK_HEAD | NAK_OTHER_ERROR),
+};
+
+const uint8_t byteParityBitsTable[256] = {
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1
 };
 
 extern void NFC_IRQLibHandler(void);
@@ -190,11 +232,33 @@ void nfca_pcd_start(void) {
 
 void nfca_pcd_stop(void) {
 	if(nfca_available) {
-		R8_NFC_001 = 0;
+		R16_NFC_001 = 0;
 		R8_NFC_CMD = 0;
 	}
 	NVIC_DisableIRQ(NFC_IRQn);
 }
+
+void nfca_pcd_wait_ms(uint32_t milliseconds) {
+	uint32_t ticks = milliseconds * NFCA_PCD_TICKS_PER_MILLISECOND;
+	
+	if (ticks > 0xFFFF) {
+		ticks = 0xFFFF;
+	}
+	
+	R16_NFC_TMR = (uint16_t)ticks;
+}
+
+void nfca_pcd_wait_us(uint32_t microseconds) {
+	uint64_t ticks = ((uint64_t)microseconds * NFCA_PCD_TICKS_PER_MILLISECOND) / 1000;
+	
+	if (ticks > 0xFFFF) {
+		ticks = 0xFFFF;
+	}
+	
+	R16_NFC_TMR = (uint16_t)ticks;
+}
+
+extern void nfca_pcd_set_out_drv(NFCA_PCD_DRV_CTRL_Def drv);
 
 void nfca_pcd_lpcd_calibration() {
 	uint8_t sensor, channel, config, tkey_cfg;
@@ -297,10 +361,10 @@ uint16_t nfca_adc_get_ant_signal(void) {
 	return (adc_data);
 }
 
-uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t bss_10e, uint8_t bss_11a, uint8_t recv_buf[], uint8_t parity_buf[], uint16_t output_len) {
+uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t num_bits, uint8_t bss_11a, uint8_t recv_buf[], uint8_t parity_buf[], uint16_t output_len) {
 	// Current position in the bitstream, combining word index and bit offset.
 	uint32_t current_total_bit_pos = bss_11a; //bit_offset;
-	uint32_t bits_remaining = bss_10e; //num_bits;
+	uint32_t bits_remaining = num_bits;
 	int32_t bytes_processed;
 	
 	// The main loop processes one output byte per iteration.
@@ -351,12 +415,14 @@ nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
 	if(BSS_R8_NFC_COMM_STATUS > 2) {
 		if(BSS_R8_NFC_INTF_STATUS) {
 			R8_NFC_CMD &= 0xef;
-			BSS_R32_NFC_114 = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_10E, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, BSS_PCD_RECV_BUF_SIZE);	
+			BSS_R32_NFC_RECV_LEN = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_RECV_BITS, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, BSS_PCD_RECV_BUF_SIZE);	
 		}
 		return BSS_R8_NFC_COMM_STATUS;
 	}
 	return 0;
 }
+
+extern uint8_t nfca_pcd_communicate(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_t offset);
 
 nfca_pcd_controller_state_t nfca_pcd_wait_communicate_end(void) {
 	nfca_pcd_controller_state_t status;
@@ -374,8 +440,8 @@ nfca_pcd_controller_state_t nfca_pcd_wait_communicate_end(void) {
 		overtimes++;
 	}
 	
-	g_nfca_pcd_recv_buf_len = nfca_pcd_get_recv_data_len();
-	g_nfca_pcd_recv_bits = nfca_pcd_get_recv_bits();
+	g_nfca_pcd_recv_buf_len = BSS_R32_NFC_RECV_LEN;
+	g_nfca_pcd_recv_bits = BSS_R16_NFC_RECV_BITS;
 	
 	return status;
 }
@@ -477,7 +543,7 @@ uint16_t PcdRequest(uint8_t req_code) {
 	nfca_pcd_controller_state_t status;
 	
 	g_nfca_pcd_send_buf[0] = req_code;
-	nfca_pcd_set_wait_us(200);
+	nfca_pcd_wait_us(200);
 
 	if(nfca_pcd_communicate(7, NFCA_PCD_REC_MODE_COLI, 0) == 0) {
 		status = nfca_pcd_wait_communicate_end();
@@ -526,7 +592,7 @@ uint16_t PcdAnticoll(uint8_t cmd) {
 	g_nfca_pcd_send_buf[0] = cmd;
 	g_nfca_pcd_send_buf[1] = 0x20;
 	
-	nfca_pcd_set_wait_ms(PCD_ANTICOLL_OVER_TIME);
+	nfca_pcd_wait_ms(PCD_ANTICOLL_OVER_TIME);
 	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_pcd_parity_buf, 2);
 
 	if (nfca_pcd_communicate(16, NFCA_PCD_REC_MODE_NORMAL, 0) == 0) {
@@ -562,7 +628,7 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr)
 	g_nfca_pcd_send_buf[0] = cmd;
 	g_nfca_pcd_send_buf[1] = 0x70;
 	g_nfca_pcd_send_buf[6] = 0;
-	nfca_pcd_set_wait_ms(PCD_SELECT_OVER_TIME);
+	nfca_pcd_wait_ms(PCD_SELECT_OVER_TIME);
 	for (res = 0; res < 4; res++) {
 		g_nfca_pcd_send_buf[res + 2] = *(pSnr + res);
 		g_nfca_pcd_send_buf[6] ^= *(pSnr + res);
@@ -598,7 +664,7 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr)
 }
 
 void PcdHalt(void) {
-	nfca_pcd_set_wait_ms(5);
+	nfca_pcd_wait_ms(5);
 	
 	g_nfca_pcd_send_buf[0] = PICC_HALT;
 	g_nfca_pcd_send_buf[1] = 0;
