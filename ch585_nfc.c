@@ -5,8 +5,8 @@
 
 #define R8_NFC_CMD                    (*(vu8*)0x4000E000)
 #define R8_NFC_STATUS                 (*(vu8*)0x4000E001)
-#define R16_NFC_CONFIG                (*(vu16*)0x4000E004)
-#define R16_NFC_TX_LEN                (*(vu16*)0x4000E008)
+#define R16_NFC_INTF_STATUS           (*(vu16*)0x4000E004)
+#define R16_NFC_RXTX_LEN              (*(vu16*)0x4000E008)
 #define R16_NFC_FIFO                  (*(vu16*)0x4000E00C)
 #define R16_NFC_TMR                   (*(vu16*)0x4000E010)
 #define R32_NFC_DRV                   (*(vu32*)0x4000E014)
@@ -20,9 +20,9 @@
 #define BSS_PCD_SEND_BUF_SIZE         (*(vu16*)0x20000102)
 #define BSS_PCD_RECV_BUF_SIZE         (*(vu16*)0x20000104)
 #define BSS_PCD_PARITY_BUF_SIZE       (*(vu16*)0x20000106)
-#define BSS_PCD_TX_NUM_BYTES          (*(vu16*)0x20000108)
-#define BSS_PCD_TX_NUM_BITS           (*(vu16*)0x2000010A)
-
+#define BSS_PCD_TX_FIFO_BYTES         (*(vu16*)0x20000108)
+#define BSS_PCD_TX_TOTAL_BYTES        (*(vu16*)0x2000010A)
+#define BSS_PCD_WORD_IDX              (*(vu16*)0x2000010C)
 #define BSS_R16_NFC_RECV_BITS         (*(vu16*)0x2000010E)
 #define BSS_R32_NFC_RECV_LEN          (*(vu32*)0x20000114)
 #define BSS_R8_NFC_11A                (*(vu8*)0x2000011A)
@@ -64,7 +64,7 @@ __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM 
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_parity_buf[NFCA_PCD_MAX_PARITY_NUM];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
 
-extern uint32_t nfca_available;
+extern uint8_t nfca_available;
 static uint16_t gs_lpcd_adc_base_value;
 uint16_t g_nfca_pcd_recv_buf_len;
 uint32_t g_nfca_pcd_recv_bits;
@@ -175,6 +175,91 @@ extern void NFC_IRQLibHandler(void);
 __INTERRUPT
 void NFC_IRQHandler(void) {
 	NFC_IRQLibHandler();
+	return;
+
+	// --- State 1: TRANSMITTING ---
+	if (BSS_R8_NFC_COMM_STATUS == 1) {
+		// Check if the TX FIFO is ready for more data (TX FIFO Empty flag)
+		if ((R16_NFC_INTF_STATUS & 8) && (BSS_PCD_TX_FIFO_BYTES < BSS_PCD_TX_TOTAL_BYTES)) {
+			// Refill the FIFO with up to 5 words
+			for (int i = 0; i < 5; i++) {
+				R16_NFC_FIFO = gs_nfca_pcd_data_buf[BSS_PCD_TX_FIFO_BYTES];
+				BSS_PCD_TX_FIFO_BYTES++;
+				if (BSS_PCD_TX_FIFO_BYTES >= BSS_PCD_TX_TOTAL_BYTES) {
+					break;
+				}
+			}
+		}
+
+		// Check if the transmission has completed (TX Complete flag)
+		if (R16_NFC_INTF_STATUS & 1) {
+			R8_NFC_CMD &= 0xfe; // Clear the Start TX bit
+
+			// If mode is Transceive, switch to receive mode
+			if (BSS_R8_NFC_INTF_MODE) {
+				funDigitalWrite( PA4, FUN_HIGH );
+				BSS_R16_NFC_RECV_BITS = 0;
+				BSS_PCD_WORD_IDX = 0;
+
+				// Set control register based on mode (e.g., enable parity)
+				R8_NFC_STATUS = (BSS_R8_NFC_INTF_MODE & 0x10) ? 0x36 : 0x26;
+	
+				BSS_R8_NFC_COMM_STATUS = 2; // Change state to Receiving
+				R8_NFC_CMD |= 0x18; // Enable RX
+				funDigitalWrite( PA4, FUN_LOW );
+			} 
+			// If mode is Transmit-only, the operation is complete
+			else {
+				R8_NFC_STATUS = 0;
+				BSS_R8_NFC_COMM_STATUS = 5; // Status: Success
+			}
+		}
+	}
+	// --- State 2: RECEIVING ---
+	else if (BSS_R8_NFC_COMM_STATUS == 2) {
+		// Check if there is data in the RX FIFO (FIFO Not Empty flag)
+		if (R16_NFC_INTF_STATUS & 4) { // Note: OV flag is used for Not Empty
+			// Drain up to 5 words from the FIFO
+			for (int i = 0; i < 5; i++) {
+				gs_nfca_pcd_data_buf[BSS_PCD_WORD_IDX++] = R16_NFC_FIFO;
+			}
+		}
+
+		// Check if the reception has completed (RX Complete flag)
+		if (R16_NFC_INTF_STATUS & 1) {
+			BSS_R16_NFC_RECV_BITS = R16_NFC_RXTX_LEN;
+			uint16_t received_words = (BSS_R16_NFC_RECV_BITS + 15) / 16;
+
+			// Drain any final words left in the FIFO
+			if (BSS_PCD_WORD_IDX < received_words) {
+				uint16_t words_to_drain = received_words - BSS_PCD_WORD_IDX;
+				for (int i = 0; i < words_to_drain; i++) {
+					gs_nfca_pcd_data_buf[BSS_PCD_WORD_IDX++] = R16_NFC_FIFO;
+				}
+			}
+			BSS_R8_NFC_COMM_STATUS = 5; // Status: Success
+		}
+		// Check for error flags
+		else if (R16_NFC_INTF_STATUS & 0x10) {
+			BSS_R16_NFC_RECV_BITS = R16_NFC_RXTX_LEN;
+			// Drain FIFO on error
+			uint16_t received_words = (BSS_R16_NFC_RECV_BITS + 15) / 16;
+			if (BSS_PCD_WORD_IDX < received_words) {
+				uint16_t words_to_drain = received_words - BSS_PCD_WORD_IDX;
+				for (int i = 0; i < words_to_drain; i++) {
+					gs_nfca_pcd_data_buf[BSS_PCD_WORD_IDX++] = R16_NFC_FIFO;
+				}
+			}
+			BSS_R8_NFC_COMM_STATUS = 3; // Status: Parity Error
+		} 
+		else if (R16_NFC_INTF_STATUS & 0x20) {
+			BSS_R8_NFC_COMM_STATUS = 4; // Status: CRC Error
+		}
+	}
+	// --- Any Other State: ERROR ---
+	else {
+		BSS_R8_NFC_COMM_STATUS = 6; // Status: General Error
+	}
 }
 
 uint16_t sys_get_vdd(void) {
@@ -420,7 +505,7 @@ nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
 	if(BSS_R8_NFC_COMM_STATUS > 2) {
 		if(BSS_R8_NFC_INTF_MODE) {
 			R8_NFC_CMD &= 0xef;
-			BSS_R32_NFC_RECV_LEN = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_RECV_BITS, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, BSS_PCD_RECV_BUF_SIZE);
+			BSS_R32_NFC_RECV_LEN = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_RECV_BITS, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, NFCA_PCD_MAX_RECV_NUM);
 			printf("r: %ld [%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x]\n", BSS_R32_NFC_RECV_LEN, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1], gs_nfca_pcd_data_buf[2], gs_nfca_pcd_data_buf[3],
 					gs_nfca_pcd_data_buf[4], gs_nfca_pcd_data_buf[5], gs_nfca_pcd_data_buf[6], gs_nfca_pcd_data_buf[7],
 					gs_nfca_pcd_data_buf[8], gs_nfca_pcd_data_buf[9], gs_nfca_pcd_data_buf[10], gs_nfca_pcd_data_buf[11]);
@@ -505,7 +590,7 @@ uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_
 	BSS_R8_NFC_BUF_OFFSET = offset;
 
 	// Set the total number of bytes to be transmitted
-	R16_NFC_TX_LEN = (uint16_t)prepared_byte_len;
+	R16_NFC_RXTX_LEN = (uint16_t)prepared_byte_len;
 
 	// Calculate the number of 9-bit words to transmit.
 	// The hardware appears to send data in 9-bit frames (8 data + 1 parity).
@@ -518,22 +603,22 @@ uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_
 		for (int i = 0; i < 8; i++) {
 			R16_NFC_FIFO = gs_nfca_pcd_data_buf[i];
 		}
-		BSS_PCD_TX_NUM_BYTES = 8;
+		BSS_PCD_TX_FIFO_BYTES = 8;
 	}
 	else {
 		// For smaller transfers, load all the words into the FIFO.
 		for (int i = 0; i < num_words; i++) {
 			R16_NFC_FIFO = gs_nfca_pcd_data_buf[i];
 		}
-		BSS_PCD_TX_NUM_BYTES = num_words;
+		BSS_PCD_TX_FIFO_BYTES = num_words;
 	}
 
 	// --- Start Transmission ---
-	BSS_PCD_TX_NUM_BITS = num_words;
+	BSS_PCD_TX_TOTAL_BYTES = num_words;
 	BSS_R8_NFC_COMM_STATUS = 1; // Status: Transmitting
 
 	// Set registers to indicate 9-bit transmission format
-	R16_NFC_CONFIG = 9;
+	R16_NFC_INTF_STATUS = 9;
 	R8_NFC_STATUS = 9;
 
 	R8_NFC_CMD |= (mode ? 9 : 1);
@@ -910,6 +995,7 @@ int main() {
 	printf("~ ch585 NFC ~\n");
 	blink(5);
 	
+	funPinMode( PA4, GPIO_CFGLR_OUT_2Mhz_PP ); // Used in the IRQHandler
 	nfca_pcd_init();
 	nfca_pcd_lpcd_calibration();
 	nfca_pcd_test();
