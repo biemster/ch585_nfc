@@ -25,8 +25,6 @@
 #define BSS_PCD_WORD_IDX              (*(vu16*)0x2000010C)
 #define BSS_R16_NFC_RECV_BITS         (*(vu16*)0x2000010E)
 #define BSS_R32_NFC_RECV_LEN          (*(vu32*)0x20000114)
-#define BSS_R8_NFC_11A                (*(vu8*)0x2000011A)
-
 #define BSS_R8_NFC_BUF_OFFSET         (*(vu8*)0x2000011A)
 #define BSS_R8_NFC_INTF_MODE          (*(vu8*)0x2000011B)
 #define BSS_R8_NFC_COMM_STATUS        (*(vu8*)0x2000011C)
@@ -170,6 +168,15 @@ const uint8_t byteParityBitsTable[256] = {
 	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
 	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1
 };
+
+void blink(int n) {
+	for(int i = n-1; i >= 0; i--) {
+		funDigitalWrite( LED, FUN_LOW ); // Turn on LED
+		Delay_Ms(33);
+		funDigitalWrite( LED, FUN_HIGH ); // Turn off LED
+		if(i) Delay_Ms(33);
+	}
+}
 
 extern void NFC_IRQLibHandler(void);
 __INTERRUPT
@@ -505,7 +512,7 @@ nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
 	if(BSS_R8_NFC_COMM_STATUS > 2) {
 		if(BSS_R8_NFC_INTF_MODE) {
 			R8_NFC_CMD &= 0xef;
-			BSS_R32_NFC_RECV_LEN = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_RECV_BITS, BSS_R8_NFC_11A, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, NFCA_PCD_MAX_RECV_NUM);
+			BSS_R32_NFC_RECV_LEN = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, BSS_R16_NFC_RECV_BITS, BSS_R8_NFC_BUF_OFFSET, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, NFCA_PCD_MAX_RECV_NUM);
 			printf("r: %ld [%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x]\n", BSS_R32_NFC_RECV_LEN, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1], gs_nfca_pcd_data_buf[2], gs_nfca_pcd_data_buf[3],
 					gs_nfca_pcd_data_buf[4], gs_nfca_pcd_data_buf[5], gs_nfca_pcd_data_buf[6], gs_nfca_pcd_data_buf[7],
 					gs_nfca_pcd_data_buf[8], gs_nfca_pcd_data_buf[9], gs_nfca_pcd_data_buf[10], gs_nfca_pcd_data_buf[11]);
@@ -518,8 +525,7 @@ nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
 	return 0;
 }
 
-extern uint32_t nfca_pcd_prepare_data(uint8_t send_buf[], uint16_t num_bits, uint8_t parity_buf[], uint16_t data_buf[]);
-uint32_t nfca_pcd_prepare_send_data(uint8_t send_buf[], uint16_t num_bits, uint8_t parity_buf[], uint16_t data_buf[]) {
+uint32_t nfca_pcd_prepare_send_data(uint8_t send_buf[], uint16_t num_bits, uint8_t parity_buf[], uint16_t data_buf[], uint32_t max_out_len) {
 	if (num_bits <= 3) {
 		return 0;
 	}
@@ -529,6 +535,11 @@ uint32_t nfca_pcd_prepare_send_data(uint8_t send_buf[], uint16_t num_bits, uint8
 
 	// Process the data in 8-byte chunks.
 	while ((num_bits - processed_bytes) >= 8) {
+		if ((processed_bytes + 8) > max_out_len) {
+			// How can I just break here, and still everything goes fine??
+			break;
+		}
+
 		for (int i = 0; i < 8; ++i) {
 			int current_index = processed_bytes + i;
 
@@ -547,13 +558,11 @@ uint32_t nfca_pcd_prepare_send_data(uint8_t send_buf[], uint16_t num_bits, uint8
 	int remaining_len = num_bits - processed_bytes;
 
 	// Process any remaining bytes that did not form a full 8-byte chunk.
-	if (remaining_len > 0) {
+	if (remaining_len > 0 && processed_bytes < max_out_len) {
 		data_buf[num_chunks] = send_buf[num_chunks] | (parity_buf[num_chunks] > 0 ? 0x0100 : 0);
 	}
 
-	// The return value is the number of 8-byte chunks multiplied by 9,
-	// plus the number of any leftover bytes.
-	return (num_chunks * 9) + remaining_len;
+	return ((num_bits / 8) *9) + (num_bits % 8); // this should reflect num_chunks??
 }
 
 uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_t offset) {
@@ -571,7 +580,7 @@ uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_
 	}
 
 	// Prepare the raw data buffers into a single packed buffer for the FIFO.
-	int prepared_byte_len = nfca_pcd_prepare_data(g_nfca_pcd_send_buf, data_bits_num, g_nfca_pcd_parity_buf, gs_nfca_pcd_data_buf);
+	int prepared_byte_len = nfca_pcd_prepare_send_data(g_nfca_pcd_send_buf, data_bits_num, g_nfca_pcd_parity_buf, gs_nfca_pcd_data_buf, NFCA_PCD_DATA_BUF_SIZE);
 	printf("s: %d [%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x]\n", prepared_byte_len, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1], gs_nfca_pcd_data_buf[2], gs_nfca_pcd_data_buf[3],
 			gs_nfca_pcd_data_buf[4], gs_nfca_pcd_data_buf[5], gs_nfca_pcd_data_buf[6], gs_nfca_pcd_data_buf[7],
 			gs_nfca_pcd_data_buf[8], gs_nfca_pcd_data_buf[9], gs_nfca_pcd_data_buf[10], gs_nfca_pcd_data_buf[11]);
@@ -909,7 +918,9 @@ void nfca_pcd_test() {
 		if(nfca_pcd_lpcd_check()) {
 			printf("* card detected\n");
 			
-			Delay_Ms(5);
+			//either blink(...) or Delay_Ms(5)
+			blink(2);
+			// Delay_Ms(5);
 	
 			res = PcdRequest(PICC_REQALL);
 			if(res == 0x0004) { /* Mifare Classic */
@@ -973,15 +984,6 @@ void nfca_pcd_test() {
 
 		nfca_pcd_stop();
 		Delay_Ms(500);
-	}
-}
-
-void blink(int n) {
-	for(int i = n-1; i >= 0; i--) {
-		funDigitalWrite( LED, FUN_LOW ); // Turn on LED
-		Delay_Ms(33);
-		funDigitalWrite( LED, FUN_HIGH ); // Turn off LED
-		if(i) Delay_Ms(33);
 	}
 }
 
