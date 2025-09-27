@@ -12,5 +12,5 @@ A couple things need to be taken care of for ch585 support in ch32fun before thi
 In parallel the NFC blob needs reversing, starting with
 - [ ] Determine which NFC/RFID tags are supported by the blob
 - [ ] Implement a ch32fun demo with the blob that can do all the protocols supported by it
-- [ ] Reverse above demo to do the protocol init and APDU's and stuff without the blob
+- [x] Reverse above demo to do the protocol init and APDU's and stuff without the blob
 - [ ] Determine if support for extra protocols is viable
