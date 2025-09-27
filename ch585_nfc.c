@@ -205,7 +205,6 @@ void NFC_IRQHandler(void) {
 
 	// --- State 1: TRANSMITTING ---
 	if (g_nfca_pcd_comm_status == 1) {
-		printf("TX (%04x)\n", intf_status);
 		// Check if the TX FIFO is ready for more data (TX FIFO Empty flag)
 		if ((intf_status & 8) && (g_nfca_pcd_send_fifo_bytes < g_nfca_pcd_send_total_bytes)) {
 			// Refill the FIFO with up to 5 words
@@ -233,26 +232,22 @@ void NFC_IRQHandler(void) {
 				g_nfca_pcd_comm_status = 2; // Change state to Receiving
 				funDigitalWrite( PA4, FUN_LOW );
 				R8_NFC_CMD |= 0x18; // Enable RX
-				printf("* tx -> rx\n");
 			} 
 			// If mode is Transmit-only, the operation is complete
 			else {
 				R8_NFC_STATUS = 0;
 				g_nfca_pcd_comm_status = 5; // Status: Success
-				printf("* tx success\n");
 			}
 		}
 	}
 	// --- State 2: RECEIVING ---
 	else if (g_nfca_pcd_comm_status == 2) {
-		printf("RX (%04x)\n", intf_status);
 		// Check if there is data in the RX FIFO (FIFO Not Empty flag)
 		if (intf_status & 4) { // Note: OV flag is used for Not Empty
 			// Drain up to 5 words from the FIFO
 			for (int i = 0; i < 5; i++) {
 				gs_nfca_pcd_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
 			}
-			printf("* FIFO drain\n");
 		}
 
 		// Check if the reception has completed (RX Complete flag)
@@ -268,7 +263,6 @@ void NFC_IRQHandler(void) {
 				}
 			}
 			g_nfca_pcd_comm_status = 5; // Status: Success
-			printf("* rx success, received %d words [%04x %04x]\n", received_words, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1]);
 		}
 		// Check for error flags
 		else if (intf_status & 0x10) {
@@ -282,16 +276,13 @@ void NFC_IRQHandler(void) {
 				}
 			}
 			g_nfca_pcd_comm_status = 3; // Status: Parity Error
-			printf("* parity error\n");
 		}
 		else if (intf_status & 0x20) {
 			g_nfca_pcd_comm_status = 4; // Status: CRC Error
-			printf("* crc error\n");
 		}
 	}
 	// --- Any Other State: ERROR ---
 	else {
-		// printf("ERR\n");
 		g_nfca_pcd_comm_status = 6; // Status: General Error
 	}
 }
