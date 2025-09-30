@@ -193,6 +193,7 @@ void blink(int n) {
 }
 
 __INTERRUPT
+__HIGH_CODE
 void NFC_IRQHandler(void) {
 	// Read the interrupt status and write it back to clear the flags.
 	uint16_t intf_status = R16_NFC_INTF_STATUS;
@@ -280,6 +281,7 @@ void NFC_IRQHandler(void) {
 	}
 }
 
+__HIGH_CODE
 uint32_t* nfca_picc_rx_find_data(uint32_t *start_ptr, uint32_t *end_ptr, uint32_t search_for_marker) {
 	// This value is used to distinguish normal timestamps from special markers.
 	const uint32_t MARKER_VALUE = 0x20000000;
@@ -313,6 +315,7 @@ uint32_t* nfca_picc_rx_find_data(uint32_t *start_ptr, uint32_t *end_ptr, uint32_
 	return NULL;
 }
 
+__HIGH_CODE
 int wch_nfca_picc_signal_decode(uint32_t *current_ptr, uint32_t *end_marker_ptr, uint32_t *dma_beg, uint32_t *dma_end) {
 	const uint32_t TIMING_THRESHOLD_BASE = 63;   // 0x3f
 	const uint32_t TIMING_OFFSET_1 = 97;         // 0x61
@@ -440,6 +443,7 @@ int wch_nfca_picc_signal_decode(uint32_t *current_ptr, uint32_t *end_marker_ptr,
 	return 0; // Success
 }
 
+__HIGH_CODE
 int wch_nfca_picc_wait_signal_decode(uint32_t *current_ptr, uint32_t **return_final_ptr, uint32_t *dma_beg, uint32_t *dma_end) {
 	const uint32_t TIMING_THRESHOLD_BASE = 63;
 	const uint32_t TIMING_OFFSET_1 = 97;
@@ -594,6 +598,7 @@ int wch_nfca_picc_send_bits(uint8_t *buf) {
 }
 
 __INTERRUPT
+__HIGH_CODE
 void TMR0_IRQHandler(void) {
 	uint32_t *dma_now, *dma_beg, *dma_end;
 	uint32_t *search_ptr, *data_ptr, *found_data;
@@ -839,6 +844,7 @@ final_exit:
 }
 
 __INTERRUPT
+__HIGH_CODE
 void TMR3_IRQHandler(void){
 	R8_TMR3_CTRL_DMA = 0;
 	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
