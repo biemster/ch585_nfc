@@ -11,10 +11,16 @@
 #define R16_NFC_TMR                   (*(vu16*)0x4000E010)
 #define R32_NFC_DRV                   (*(vu32*)0x4000E014)
 
-#define NFCA_PCD_DATA_BUF_SIZE                   32
-#define NFCA_PCD_MAX_SEND_NUM                    (NFCA_PCD_DATA_BUF_SIZE)
-#define NFCA_PCD_MAX_RECV_NUM                    (NFCA_PCD_DATA_BUF_SIZE * 16 / 9)
-#define NFCA_PCD_MAX_PARITY_NUM                  (NFCA_PCD_MAX_RECV_NUM)
+#define RB_TMR_FREQ_13_56             0x20
+#define TMR0_NFCA_PICC_CNT_END        288
+#define TMR3_NFCA_PICC_CNT_END        18
+
+
+#define NFCA_DATA_BUF_SIZE                       32
+#define NFCA_PICC_SIGNAL_BUF_SIZE                512
+#define NFCA_PCD_MAX_SEND_NUM                    (NFCA_DATA_BUF_SIZE)
+#define NFCA_PCD_MAX_RECV_NUM                    (NFCA_DATA_BUF_SIZE * 16 / 9)
+#define NFCA_MAX_PARITY_NUM                      (NFCA_PCD_MAX_RECV_NUM)
 #define NFCA_PCD_LPCD_THRESHOLD_PERMIL           5
 #define NFCA_PCD_LPCD_THRESHOLD_MAX_LIMIT_PERMIL 20
 #define NFCA_PCD_WAIT_MAX_MS                     1000
@@ -38,11 +44,13 @@
 #define ISO14443A_CHECK_BCC(B)    ((B[0] ^ B[1] ^ B[2] ^ B[3]) == B[4])
 #define NFCA_PCD_SET_OUT_DRV(lvl) (R32_NFC_DRV = ((R32_NFC_DRV & 0x9ff) | lvl))
 
-__attribute__((aligned(4))) static uint16_t gs_nfca_pcd_data_buf[NFCA_PCD_DATA_BUF_SIZE];
+__attribute__((aligned(4))) static uint16_t gs_nfca_data_buf[NFCA_DATA_BUF_SIZE];
+__attribute__((aligned(4))) uint8_t g_nfca_parity_buf[NFCA_MAX_PARITY_NUM];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM + 3) & 0xfffc)];
-__attribute__((aligned(4))) uint8_t g_nfca_pcd_parity_buf[NFCA_PCD_MAX_PARITY_NUM];
+__attribute__((aligned(4))) static uint32_t gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
+uint8_t picc_uid[7];
 
 static uint16_t gs_lpcd_adc_base_value;
 uint16_t g_nfca_pcd_recv_buf_len;
@@ -137,6 +145,25 @@ enum {
 	PICC_NAK_OTHER_ERROR      = (PICC_NAK_HEAD | NAK_OTHER_ERROR),
 };
 
+typedef enum {
+	High_Level = 0,
+	Low_Level,
+} PWMX_PolarTypeDef;
+
+typedef enum {
+	PWM_Times_1 = 0,
+	PWM_Times_4,
+	PWM_Times_8,
+	PWM_Times_16,
+} PWM_RepeatTsTypeDef;
+
+typedef enum {
+	CAP_NULL = 0,
+	Edge_To_Edge,
+	FallEdge_To_FallEdge,
+	RiseEdge_To_RiseEdge,
+} CapModeTypeDef;
+
 const uint8_t byteParityBitsTable[256] = {
 	1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
 	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
@@ -165,38 +192,6 @@ void blink(int n) {
 	}
 }
 
-/*
-~ ch585 NFC ~
-NFC drive lvl1
-* card detected
-s: 7 [0052 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000]
-      [52 00 00 00 00 00 00 00 00 00 00 00]
-r: 2 [0144 0002 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000]
-      [44 00 00 00 00 00 00 00 00 00 00 00]
-s: 18 [0193 0020 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000]
-      [93 20 00 00 00 00 00 00 00 00 00 00]
-r: 5 [0988 ed40 1414 0000 0000 0000 0000 0000 0000 0000 0000 0000]
-      [88 04 50 9d 41 00 00 00 00 00 00 00]
-s: 81 [0193 0070 0188 0004 0150 009d 0141 014e 0002 0000 0000 0000]
-      [93 70 88 04 50 9d 41 4e 02 00 00 00]
-r: 3 [b404 045d 0188 0004 0150 009d 0141 014e 0002 0000 0000 0000]
-      [04 da 17 9d 41 00 00 00 00 00 00 00]
-s: 18 [0195 0020 0188 0004 0150 009d 0141 014e 0002 0000 0000 0000]
-      [95 20 88 04 50 9d 41 4e 02 00 00 00]
-r: 5 [8a7a 04af 1144 0004 0150 009d 0141 014e 0002 0000 0000 0000]
-      [7a c5 2b 80 14 00 00 00 00 00 00 00]
-Mifare Ultralight uid: 04 50 9d 7a c5 2b 80
-s: 81 [0195 0070 007a 01c5 012b 0080 0114 0070 017d 0000 0000 0000]
-      [95 70 7a c5 2b 80 14 70 7d 00 00 00]
-r: 3 [fd00 0145 007a 01c5 012b 0080 0114 0070 017d 0000 0000 0000]
-      [00 fe 51 80 14 00 00 00 00 00 00 00]
-select OK, SAK: 00
-s: 36 [0150 0100 0057 00cd 012b 0080 0114 0070 017d 0000 0000 0000]
-      [50 00 57 cd 2b 80 14 70 7d 00 00 00]
-r: 0 [0150 0100 0057 00cd 012b 0080 0114 0070 017d 0000 0000 0000]
-      [00 fe 51 80 14 00 00 00 00 00 00 00]
-*/
-
 __INTERRUPT
 void NFC_IRQHandler(void) {
 	// Read the interrupt status and write it back to clear the flags.
@@ -209,7 +204,7 @@ void NFC_IRQHandler(void) {
 		if ((intf_status & 8) && (g_nfca_pcd_send_fifo_bytes < g_nfca_pcd_send_total_bytes)) {
 			// Refill the FIFO with up to 5 words
 			for (int i = 0; i < 5; i++) {
-				R16_NFC_FIFO = gs_nfca_pcd_data_buf[g_nfca_pcd_send_fifo_bytes++];
+				R16_NFC_FIFO = gs_nfca_data_buf[g_nfca_pcd_send_fifo_bytes++];
 				if (g_nfca_pcd_send_fifo_bytes >= g_nfca_pcd_send_total_bytes) {
 					break;
 				}
@@ -222,7 +217,6 @@ void NFC_IRQHandler(void) {
 			// If mode is Transceive, switch to receive mode
 			R8_NFC_CMD &= ~(0x01); // Clear the Start TX bit
 			if (g_nfca_pcd_intf_mode) {
-				funDigitalWrite( PA4, FUN_HIGH );
 				g_nfca_pcd_recv_bits = 0;
 				g_nfca_pcd_recv_word_idx = 0;
 
@@ -230,7 +224,6 @@ void NFC_IRQHandler(void) {
 				R8_NFC_STATUS = (g_nfca_pcd_intf_mode & 0x10) ? 0x36 : 0x26;
 
 				g_nfca_pcd_comm_status = 2; // Change state to Receiving
-				funDigitalWrite( PA4, FUN_LOW );
 				R8_NFC_CMD |= 0x18; // Enable RX
 			} 
 			// If mode is Transmit-only, the operation is complete
@@ -246,7 +239,7 @@ void NFC_IRQHandler(void) {
 		if (intf_status & 4) { // Note: OV flag is used for Not Empty
 			// Drain up to 5 words from the FIFO
 			for (int i = 0; i < 5; i++) {
-				gs_nfca_pcd_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
+				gs_nfca_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
 			}
 		}
 
@@ -259,7 +252,7 @@ void NFC_IRQHandler(void) {
 			if (g_nfca_pcd_recv_word_idx < received_words) {
 				uint16_t words_to_drain = received_words - g_nfca_pcd_recv_word_idx;
 				for (int i = 0; i < words_to_drain; i++) {
-					gs_nfca_pcd_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
+					gs_nfca_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
 				}
 			}
 			g_nfca_pcd_comm_status = 5; // Status: Success
@@ -272,7 +265,7 @@ void NFC_IRQHandler(void) {
 			if (g_nfca_pcd_recv_word_idx < received_words) {
 				uint16_t words_to_drain = received_words - g_nfca_pcd_recv_word_idx;
 				for (int i = 0; i < words_to_drain; i++) {
-					gs_nfca_pcd_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
+					gs_nfca_data_buf[g_nfca_pcd_recv_word_idx++] = R16_NFC_FIFO;
 				}
 			}
 			g_nfca_pcd_comm_status = 3; // Status: Parity Error
@@ -285,6 +278,575 @@ void NFC_IRQHandler(void) {
 	else {
 		g_nfca_pcd_comm_status = 6; // Status: General Error
 	}
+}
+
+uint32_t* nfca_picc_rx_find_data(uint32_t *start_ptr, uint32_t *end_ptr, uint32_t search_for_marker) {
+	// This value is used to distinguish normal timestamps from special markers.
+	const uint32_t MARKER_VALUE = 0x20000000;
+
+	// If the start is at or after the end, the range is invalid.
+	if (start_ptr >= end_ptr) {
+		return NULL;
+	}
+
+	// The loop starts at the word *before* end_ptr and iterates backwards down to start_ptr.
+	for (uint32_t* current_ptr = end_ptr - 1; current_ptr >= start_ptr; current_ptr--) {
+		uint32_t current_value = *current_ptr;
+
+		if (search_for_marker != 0) {
+			// Mode 1: Find a marker.
+			// If `current_value` is NOT less than `MARKER_VALUE`, we found it.
+			if (current_value >= MARKER_VALUE) {
+				return current_ptr; // Success, return the pointer.
+			}
+		}
+		else {
+			// Mode 0: Find a non-marker (i.e., normal data).
+			// If `current_value` IS less than `MARKER_VALUE`, we found it.
+			if (current_value < MARKER_VALUE) {
+				return current_ptr; // Success, return the pointer.
+			}
+		}
+	}
+
+	// If the loop completes without finding a matching value, return NULL.
+	return NULL;
+}
+
+int wch_nfca_picc_signal_decode(uint32_t *current_ptr, uint32_t *end_marker_ptr, uint32_t *dma_beg, uint32_t *dma_end) {
+	const uint32_t TIMING_THRESHOLD_BASE = 63;   // 0x3f
+	const uint32_t TIMING_OFFSET_1 = 97;         // 0x61
+	const uint32_t TIMING_OFFSET_2 = 161;        // 0xa1
+	const uint32_t TIMING_OFFSET_3 = 225;        // 0xe1
+
+	// This marker is written into the DMA buffer to show a timestamp has been processed.
+	const uint32_t PROCESSED_MARKER = 0x20000001;
+
+	uint32_t time_accumulator = 0;
+	uint8_t  current_byte_pos = 0; // Tracks which byte in rx_buffer we're writing to.
+	uint8_t  current_bit_pos = 0;  // Tracks which bit in the current byte (0-7).
+	int      decoder_state = 0;    // The main state machine flag (register t3).
+	uint32_t total_bits_rcvd = 0;
+
+	// --- Initialization ---
+	g_nfca_pcd_recv_buf[0] = 0; // Clear the first byte of the destination buffer.
+
+	// --- Main Decoding Loop ---
+	// This loop iterates through the circular buffer from the start to the end marker.
+	for (;; current_ptr++) {
+		// Handle wrap-around for the circular buffer.
+		if (current_ptr >= dma_end) {
+			current_ptr = dma_beg;
+		}
+		// The loop exit condition.
+		if (current_ptr == end_marker_ptr) {
+			break;
+		}
+
+		uint32_t timestamp = *current_ptr;
+		time_accumulator += timestamp;
+
+		// If the accumulated time is too short, it's likely noise or part of a
+		// longer pulse. Mark it and continue accumulating.
+		if (time_accumulator <= TIMING_THRESHOLD_BASE) {
+			*current_ptr = PROCESSED_MARKER;
+			continue;
+		}
+
+		uint8_t decoded_bits[2];
+		int num_bits_decoded = 0;
+		uint32_t delta = 0;
+
+		// --- The State Machine for Pulse Width Decoding ---
+		if (decoder_state != 0) {
+			delta = time_accumulator - TIMING_OFFSET_3; // 225
+			if (delta <= TIMING_THRESHOLD_BASE) {
+				// Long pulse after short pulse -> decodes to "10"
+				decoded_bits[0] = 1;
+				decoded_bits[1] = 0;
+				num_bits_decoded = 2;
+				decoder_state = 0; // Reset state
+			}
+			else {
+				delta = time_accumulator - TIMING_OFFSET_2; // 161
+				if (delta <= TIMING_THRESHOLD_BASE) {
+					// Medium-long pulse after short pulse -> decodes to "01"
+					decoded_bits[0] = 0;
+					decoded_bits[1] = 1;
+					num_bits_decoded = 2;
+					decoder_state = 0; // Reset state
+				}
+				else {
+					return 1; // Error: Invalid timing sequence
+				}
+			}
+		}
+		else { // decoder_state == 0
+			delta = time_accumulator - TIMING_OFFSET_1; // 97
+			if (delta <= TIMING_THRESHOLD_BASE) {
+				// Medium pulse -> state transition, wait for next pulse
+				decoded_bits[0] = 1;
+				num_bits_decoded = 1;
+				decoder_state = 1; // Set state
+			}
+			else {
+				delta = time_accumulator - TIMING_OFFSET_2; // 161
+				if (delta <= TIMING_THRESHOLD_BASE) {
+					// Medium-long pulse -> decodes to "0"
+					decoded_bits[0] = 0;
+					num_bits_decoded = 1;
+					// decoder_state remains 0
+				}
+				else {
+					return 1; // Error: Invalid timing
+				}
+			}
+		}
+
+		// --- Bit Packing Logic ---
+		if (num_bits_decoded > 0) {
+			for (int i = 0; i < num_bits_decoded; i++) {
+				// If the current byte is full, advance to the next one.
+				if (current_bit_pos == 8) {
+					current_bit_pos = 0;
+					current_byte_pos++;
+					// Check for receive buffer overflow.
+					if (current_byte_pos >= NFCA_PCD_MAX_RECV_NUM) {
+						return 1; // Error: Buffer full
+					}
+					// Clear the new byte.
+					g_nfca_pcd_recv_buf[current_byte_pos] = 0;
+				}
+
+				// Place the decoded bit into the correct position in the current byte.
+				g_nfca_pcd_recv_buf[current_byte_pos] |= (decoded_bits[i] << current_bit_pos);
+				current_bit_pos++;
+			}
+			total_bits_rcvd += num_bits_decoded;
+		}
+
+		// Reset accumulator and mark the timestamp as processed.
+		time_accumulator = 0;
+		*current_ptr = PROCESSED_MARKER;
+	}
+
+	// --- Finalization ---
+	// If the loop ends but the state machine is still waiting for a second pulse,
+	// it means the last bit was incomplete. The assembly corrects the bit count.
+	if (decoder_state == 0 && total_bits_rcvd > 0) {
+		total_bits_rcvd--;
+	}
+
+	return 0; // Success
+}
+
+int wch_nfca_picc_wait_signal_decode(uint32_t *current_ptr, uint32_t **return_final_ptr, uint32_t *dma_beg, uint32_t *dma_end) {
+	const uint32_t TIMING_THRESHOLD_BASE = 63;
+	const uint32_t TIMING_OFFSET_1 = 97;
+	const uint32_t TIMING_OFFSET_2 = 161;
+	const uint32_t TIMING_OFFSET_3 = 225;
+	const uint32_t PROCESSED_MARKER = 0x20000001;
+	const uint32_t UNPROCESSED_MARKER = 0x20000000;
+
+	// Local state variables.
+	uint32_t time_accumulator = 0;
+	uint8_t  current_byte_pos = 0;
+	uint8_t  current_bit_pos = 0;
+	int      decoder_state = 0;
+	uint32_t total_bits_rcvd = 0;
+
+	// Initialization.
+	g_nfca_pcd_recv_buf[0] = 0;
+
+	// The main processing loop.
+	for (;; current_ptr++) {
+		// Handle circular buffer wrap-around for the processing pointer.
+		if (current_ptr >= dma_end) {
+			current_ptr = dma_beg;
+		}
+
+		// --- The "Wait" Logic ---
+		// This is the core of the function. It spins here until the hardware DMA
+		// pointer has moved past the memory location we are about to process.
+		// This synchronizes the CPU with the DMA hardware.
+		uint32_t* last_written_word;
+		do {
+			uint32_t dma_now_offset = R32_TMR0_DMA_NOW;
+			uint32_t* dma_now_ptr = (uint32_t*)(dma_now_offset | (1 << 29)); // Add RAM base
+
+			if (dma_now_ptr == dma_beg) {
+				last_written_word = dma_end - 1;
+			}
+			else {
+				last_written_word = dma_now_ptr - 1;
+			}
+		} while (current_ptr == last_written_word);
+
+		// Read the timestamp and immediately mark it as processed.
+		uint32_t timestamp = *current_ptr;
+		*current_ptr = PROCESSED_MARKER;
+		time_accumulator += timestamp;
+
+		// If time is too short, continue accumulating.
+		if (time_accumulator <= TIMING_THRESHOLD_BASE) {
+			continue;
+		}
+
+		// --- State Machine for Pulse Width Decoding (similar to the other function) ---
+		uint8_t decoded_bits[2];
+		int num_bits_decoded = 0;
+		uint32_t delta = 0;
+
+		if (decoder_state != 0) {
+			delta = time_accumulator - TIMING_OFFSET_3; // 225
+			if (delta <= TIMING_THRESHOLD_BASE) {
+				decoded_bits[0] = 1;
+				decoded_bits[1] = 0;
+				num_bits_decoded = 2;
+			}
+			else {
+				delta = time_accumulator - TIMING_OFFSET_2; // 161
+				if (delta <= TIMING_THRESHOLD_BASE) {
+					decoded_bits[0] = 0;
+					decoded_bits[1] = 1;
+					num_bits_decoded = 2;
+					decoder_state = 0;
+				}
+				else { // Invalid timing
+					if (time_accumulator < UNPROCESSED_MARKER) {
+						*return_final_ptr = current_ptr;
+						return 0; // Success case with specific state
+					}
+					*return_final_ptr = current_ptr; // Store final pointer
+					return 1; // Error
+				}
+			}
+		}
+		else { // decoder_state == 0
+			delta = time_accumulator - TIMING_OFFSET_1; // 97
+			if (delta <= TIMING_THRESHOLD_BASE) {
+				decoded_bits[0] = 1;
+				num_bits_decoded = 1;
+				decoder_state = 1;
+			}
+			else {
+				delta = time_accumulator - TIMING_OFFSET_2; // 161
+				if (delta <= TIMING_THRESHOLD_BASE) {
+					decoded_bits[0] = 0;
+					num_bits_decoded = 1;
+				}
+				else { // Invalid timing
+					if (time_accumulator < UNPROCESSED_MARKER) {
+						if (total_bits_rcvd > 0) {
+							total_bits_rcvd--;
+						}
+						*return_final_ptr = current_ptr;
+						return 0; // Success
+					}
+					*return_final_ptr = current_ptr;
+					return 1; // Error
+				}
+			}
+		}
+
+		// --- Bit Packing Logic ---
+		if (num_bits_decoded > 0) {
+			for (int i = 0; i < num_bits_decoded; i++) {
+				if (current_bit_pos == 8) {
+					current_bit_pos = 0;
+					current_byte_pos++;
+					if (current_byte_pos >= NFCA_PCD_MAX_RECV_NUM) {
+						// Find the last valid non-marker pointer before returning.
+						uint32_t* final_ptr = dma_end - 1;
+						while(1) {
+							uint32_t dma_now_offset = R32_TMR0_DMA_NOW;
+							uint32_t* dma_now_ptr = (uint32_t*)(dma_now_offset | (1 << 29));
+							if (dma_now_ptr == dma_beg) {
+								final_ptr = dma_end - 1;
+							}
+							else {
+								final_ptr = dma_now_ptr - 1;
+							}
+							if (current_ptr != final_ptr) {
+								break;
+							}
+						}
+						if(*final_ptr >= UNPROCESSED_MARKER) {
+							return 1;
+						}
+						*return_final_ptr = final_ptr;
+						return 1; // Buffer full error
+					}
+					g_nfca_pcd_recv_buf[current_byte_pos] = 0;
+				}
+				g_nfca_pcd_recv_buf[current_byte_pos] |= (decoded_bits[i] << current_bit_pos);
+				current_bit_pos++;
+			}
+			total_bits_rcvd += num_bits_decoded;
+		}
+
+		time_accumulator = 0;
+	} // End of for loop - this loop is only exited via returns inside.
+}
+
+int wch_nfca_picc_send_bits(uint8_t *buf) {
+	return 0;
+}
+
+__INTERRUPT
+void TMR0_IRQHandler(void) {
+	uint32_t *dma_now, *dma_beg, *dma_end;
+	uint32_t *search_ptr, *data_ptr, *found_data;
+	uint32_t val;
+
+	//  Clear TMR0 interrupt flag
+	val = R8_TMR0_INT_FLAG;
+	R8_TMR0_INT_FLAG = val;
+
+	dma_beg = (uint32_t*) (R32_TMR0_DMA_BEG | (1 << 29));
+	dma_end = (uint32_t*) (R32_TMR0_DMA_END | (1 << 29));
+	dma_now = (uint32_t*) (R32_TMR0_DMA_NOW | (1 << 29));
+
+	// 0x1cd6: Check if dma_beg == dma_now
+	if (dma_beg == dma_now) {
+		search_ptr = dma_end - 1; // Corresponds to addi s0, s2, -4
+	}
+	else {
+		// 0x1cda: Check if dma_now < dma_end
+		if ((uintptr_t)dma_now < (uintptr_t)dma_end) {
+			// 0x1d10: Check if dma_beg >= dma_now
+			if ((uintptr_t)dma_beg >= (uintptr_t)dma_now) {
+				goto reset_timer_and_exit;
+			}
+			search_ptr = dma_now - 1;
+		}
+		else {
+			search_ptr = dma_now;
+		}
+	}
+
+	// Main logic starts here, corresponds to LAB_00001d16
+	val = *search_ptr;
+
+	// Check if the value at search_ptr is a special value (>= 0x20000000)
+	if (val >= 0x20000000) {
+		// --- Logic for handling special value (>= 0x20000000) ---
+		// This part of the code seems to reconfigure the timer and search for data differently.
+		R8_TMR0_CTRL_DMA = 0; // Disable DMA
+		R8_TMR0_CTRL_MOD = 2; // Set TMR0 mode to 2
+
+		uint32_t timer_count = R32_TMR0_COUNT;
+		R32_TMR0_CNT_END = (0x390 - timer_count); // Set new end count
+
+		R8_TMR0_CTRL_MOD = 0; // Set TMR0 mode to 0
+		R8_TMR0_CTRL_MOD = 0x24; // Set TMR0 mode to 0x24 (Run timer)
+
+		// Search for data patterns
+		data_ptr = nfca_picc_rx_find_data(dma_beg, search_ptr, 0);
+		if (data_ptr) {
+			if ((uintptr_t)data_ptr < (uintptr_t)search_ptr) {
+				found_data = nfca_picc_rx_find_data(search_ptr + 1, data_ptr, 1);
+				if (!found_data) {
+					goto reset_timer_and_exit;
+				}
+			}
+			else {
+				// Search from two different memory regions
+				found_data = nfca_picc_rx_find_data(dma_beg, data_ptr, 1);
+				if (!found_data) {
+					found_data = nfca_picc_rx_find_data(search_ptr + 1, dma_end, 1);
+					if (!found_data) {
+						goto reset_timer_and_exit;
+					}
+				}
+			}
+
+			// Calculate offset and prepare for signal decode
+			uint32_t offset;
+			if((uintptr_t)found_data > (uintptr_t)data_ptr){
+				offset = (uintptr_t)data_ptr + (uintptr_t)dma_beg - (uintptr_t)dma_end - (uintptr_t)found_data;
+			}
+			else {
+				offset = (uintptr_t)data_ptr - (uintptr_t)found_data;
+			}
+			search_ptr = (uint32_t*)(offset >> 2); // Divide by 4
+
+			if((uintptr_t)found_data < (uintptr_t)data_ptr) {
+				uintptr_t s3 = (uintptr_t)dma_end - (uintptr_t)dma_beg + (uintptr_t)data_ptr;
+				s3 = s3 - (uintptr_t)found_data;
+
+				if (s3 <= 8) {
+					goto reset_timer_and_exit;
+				}
+
+				if((uintptr_t)search_ptr <= 4){
+					// A series of timer adjustments based on search_ptr
+					R8_TMR0_CTRL_MOD = 0x20;
+					if((R8_TMR0_INT_FLAG & 1) == 0){
+						uint32_t current_count = R32_TMR0_COUNT;
+						uint32_t new_count = (uint32_t)search_ptr * 0x120 + current_count;
+						if (0x49b < new_count) {
+							R8_TMR0_CTRL_MOD = 2;
+							R8_TMR0_CTRL_MOD = 0;
+							R32_TMR0_CNT_END = 0x4b0 - new_count;
+						}
+					}
+				}
+
+				R8_TMR0_CTRL_MOD = 0x24;
+				// Now, prepare for the signal decode call. First, write a marker
+				// value (0x20000001) into the buffer to mark this data as processed.
+				const uint32_t PROCESSED_MARKER = 0x20000001;
+				uint32_t* next_word_ptr;
+
+				// This logic handles writing the marker and figuring out the
+				// next pointer, including buffer wrap-around.
+				if (found_data + 1 >= dma_end) {
+					*dma_beg = PROCESSED_MARKER;
+					next_word_ptr = dma_beg + 1;
+				}
+				else {
+					*(found_data + 1) = PROCESSED_MARKER;
+					next_word_ptr = found_data + 2;
+					if (next_word_ptr >= dma_end) {
+						next_word_ptr = dma_beg;
+					}
+				}
+
+				// Finally, call the main signal decoder for this path.
+				// Note: `data_ptr` was saved to the stack and is being passed here as the 3rd arg.
+				if (wch_nfca_picc_signal_decode(data_ptr, next_word_ptr, dma_beg, dma_end) != 0) {
+					goto reset_timer_and_exit;
+				}
+			}
+		}
+		else {
+			data_ptr = nfca_picc_rx_find_data(search_ptr + 2, dma_end, 0);
+			if(!data_ptr) {
+				goto reset_timer_and_exit;
+			}
+		}
+	}
+	else {
+		// --- Logic for handling normal value (< 0x20000000) ---
+		data_ptr = nfca_picc_rx_find_data(dma_beg, search_ptr, 1);
+		if (!data_ptr) {
+			data_ptr = nfca_picc_rx_find_data(search_ptr + 1, dma_end, 1);
+			if (!data_ptr) {
+				goto reset_timer_and_exit;
+			}
+		}
+
+		found_data = data_ptr + 1;
+		if ((uintptr_t)found_data >= (uintptr_t)dma_end) {
+			found_data = dma_beg;
+		}
+
+		// Mark the memory location
+		*found_data = 0x20000001;
+
+		// This is a complex loop to find the previous valid DMA pointer
+		uint32_t* prev_ptr = dma_end - 1;
+		while(1) {
+			uint32_t* current_dma_now = (uint32_t*) (R32_TMR0_DMA_NOW | (1 << 29));
+			if(current_dma_now == dma_beg) {
+				break;
+			}
+			prev_ptr = current_dma_now - 1;
+			if(prev_ptr != found_data) {
+				break;
+			}
+		}
+
+		uint32_t* next_ptr = found_data + 1;
+		if((uintptr_t)next_ptr >= (uintptr_t)dma_end){
+			next_ptr = dma_beg;
+		}
+
+		if (*(next_ptr) >= 0x20000000) {
+			goto reset_timer_and_exit;
+		}
+
+		uint32_t* ptr_at_decode_stop;
+		// Call the wait/decode function. It will block while the hardware receives more data.
+		if (wch_nfca_picc_wait_signal_decode(prev_ptr, &ptr_at_decode_stop, dma_beg, dma_end) != 0) {
+			goto reset_timer_and_exit;
+		}
+
+		// After the call, ptr_at_decode_stop has been set by the function.
+		// Now, get the most current DMA pointer from hardware.
+		uint32_t* ptr_at_irq_resume;
+		uint32_t* current_dma_now = (uint32_t*)((uintptr_t)R32_TMR0_DMA_NOW | (1 << 29));
+
+		if (current_dma_now == dma_beg) {
+			ptr_at_irq_resume = dma_end - 1;
+		}
+		else {
+			ptr_at_irq_resume = current_dma_now - 1;
+		}
+
+		// Now, perform the final calculation using both pointers.
+		uintptr_t count;
+		if ((uintptr_t)ptr_at_irq_resume < (uintptr_t)ptr_at_decode_stop) {
+			// Complex wrap-around calculation involving both pointers.
+			count = ((uintptr_t)dma_end - (uintptr_t)ptr_at_decode_stop) + ((uintptr_t)ptr_at_irq_resume - (uintptr_t)dma_beg);
+		}
+		else {
+			count = (uintptr_t)ptr_at_irq_resume - (uintptr_t)ptr_at_decode_stop;
+		}
+		uint32_t symbol_count = count >> 2;
+
+		// Use this precise symbol count to set up the timer for the response.
+		R8_TMR0_CTRL_DMA = 0;
+		R8_TMR0_CTRL_MOD = 2;
+
+		uint32_t current_timer_val = R32_TMR0_COUNT;
+		uint32_t ticks_to_wait = (symbol_count + 1) * 0x120; // 0x120 is likely clock ticks per symbol
+		uint32_t final_timer_target = current_timer_val + ticks_to_wait;
+
+		if (final_timer_target < 0x49b) {
+			R32_TMR0_CNT_END = 0x4b0 - final_timer_target;
+		}
+		else {
+			R32_TMR0_CNT_END = ticks_to_wait;
+		}
+		R8_TMR0_CTRL_MOD = 0x24; // Start timer
+	}
+
+	printf("We got data!\n");
+
+	if (wch_nfca_picc_send_bits(picc_uid) != 0) {
+		goto reset_timer_and_exit;
+	}
+
+	goto final_exit;
+
+reset_timer_and_exit:
+	// It resets the timer to a default state
+	R8_TMR0_CTRL_MOD = 2;
+	R8_TMR0_CTRL_MOD = 0;
+	R8_TMR0_CTRL_DMA = 5;
+	R32_TMR0_CNT_END = 0x120;
+	R8_TMR0_CTRL_MOD = 0xE5;
+
+final_exit:
+	printf("TMR0 no data\n");
+	NVIC_ClearPendingIRQ(TMR0_IRQn);
+	printf("rcv [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
+			g_nfca_pcd_recv_buf[0], g_nfca_pcd_recv_buf[1], g_nfca_pcd_recv_buf[2], g_nfca_pcd_recv_buf[3],
+			g_nfca_pcd_recv_buf[4], g_nfca_pcd_recv_buf[5], g_nfca_pcd_recv_buf[6], g_nfca_pcd_recv_buf[7],
+			g_nfca_pcd_recv_buf[8], g_nfca_pcd_recv_buf[9], g_nfca_pcd_recv_buf[10], g_nfca_pcd_recv_buf[11]);
+}
+
+__INTERRUPT
+void TMR3_IRQHandler(void){
+	R8_TMR3_CTRL_DMA = 0;
+	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
+	R32_TMR0_CNT_END = 0x120;
+	R8_TMR0_CTRL_DMA = 5;
+	R32_TMR0_CONTROL = 0xe5;
+
+	NVIC_ClearPendingIRQ(TMR0_IRQn);
 }
 
 uint16_t sys_get_vdd(void) {
@@ -316,14 +878,14 @@ int ADC_VoltConverSignalPGA_MINUS_12dB(uint16_t adc_data) {
 	return (((int)adc_data*1050+256)/512 - 3*1050);
 }
 
-// NFCA functions
-void nfca_pcd_init() {
+void nfca_init() {
 	funPinMode( (PB8 | PB9 | PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 	
 	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB)<< 16);
 	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8);
 }
 
+// NFCA PCD functions
 void nfca_pcd_start(void) {
 	R8_NFC_CMD = 0x24;
 	R32_NFC_DRV &= 0xe7ff;
@@ -509,17 +1071,10 @@ uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t num_bits, uin
 }
 
 nfca_pcd_controller_state_t nfca_pcd_get_comm_status() {
-	// printf("stat %d, mode %d\n", g_nfca_pcd_comm_status, g_nfca_pcd_intf_mode);
 	if(g_nfca_pcd_comm_status > 2) {
 		if(g_nfca_pcd_intf_mode) {
 			R8_NFC_CMD &= 0xef;
-			g_nfca_pcd_recv_buf_len = nfca_pcd_separate_recv_data(gs_nfca_pcd_data_buf, g_nfca_pcd_recv_bits, g_nfca_pcd_buf_offset, g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, NFCA_PCD_MAX_RECV_NUM);
-			printf("r: %d [%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x]\n", g_nfca_pcd_recv_buf_len, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1], gs_nfca_pcd_data_buf[2], gs_nfca_pcd_data_buf[3],
-					gs_nfca_pcd_data_buf[4], gs_nfca_pcd_data_buf[5], gs_nfca_pcd_data_buf[6], gs_nfca_pcd_data_buf[7],
-					gs_nfca_pcd_data_buf[8], gs_nfca_pcd_data_buf[9], gs_nfca_pcd_data_buf[10], gs_nfca_pcd_data_buf[11]);
-			printf("      [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n", g_nfca_pcd_recv_buf[0], g_nfca_pcd_recv_buf[1], g_nfca_pcd_recv_buf[2], g_nfca_pcd_recv_buf[3],
-					g_nfca_pcd_recv_buf[4], g_nfca_pcd_recv_buf[5], g_nfca_pcd_recv_buf[6], g_nfca_pcd_recv_buf[7],
-					g_nfca_pcd_recv_buf[8], g_nfca_pcd_recv_buf[9], g_nfca_pcd_recv_buf[10], g_nfca_pcd_recv_buf[11]);
+			g_nfca_pcd_recv_buf_len = nfca_pcd_separate_recv_data(gs_nfca_data_buf, g_nfca_pcd_recv_bits, g_nfca_pcd_buf_offset, g_nfca_pcd_recv_buf, g_nfca_parity_buf, NFCA_PCD_MAX_RECV_NUM);
 		}
 		return g_nfca_pcd_comm_status;
 	}
@@ -568,13 +1123,7 @@ uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_
 	}
 
 	// Prepare the raw data buffers into a single packed buffer for the FIFO.
-	int prepared_byte_len = nfca_pcd_prepare_send_data(g_nfca_pcd_send_buf, data_bits_num, g_nfca_pcd_parity_buf, gs_nfca_pcd_data_buf, NFCA_PCD_DATA_BUF_SIZE);
-	printf("s: %d [%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x]\n", prepared_byte_len, gs_nfca_pcd_data_buf[0], gs_nfca_pcd_data_buf[1], gs_nfca_pcd_data_buf[2], gs_nfca_pcd_data_buf[3],
-			gs_nfca_pcd_data_buf[4], gs_nfca_pcd_data_buf[5], gs_nfca_pcd_data_buf[6], gs_nfca_pcd_data_buf[7],
-			gs_nfca_pcd_data_buf[8], gs_nfca_pcd_data_buf[9], gs_nfca_pcd_data_buf[10], gs_nfca_pcd_data_buf[11]);
-	printf("      [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n", g_nfca_pcd_send_buf[0], g_nfca_pcd_send_buf[1], g_nfca_pcd_send_buf[2], g_nfca_pcd_send_buf[3],
-			g_nfca_pcd_send_buf[4], g_nfca_pcd_send_buf[5], g_nfca_pcd_send_buf[6], g_nfca_pcd_send_buf[7],
-			g_nfca_pcd_send_buf[8], g_nfca_pcd_send_buf[9], g_nfca_pcd_send_buf[10], g_nfca_pcd_send_buf[11]);
+	int prepared_byte_len = nfca_pcd_prepare_send_data(g_nfca_pcd_send_buf, data_bits_num, g_nfca_parity_buf, gs_nfca_data_buf, NFCA_DATA_BUF_SIZE);
 
 	// --- Configure NFC Hardware ---
 	R8_NFC_STATUS = 0; // Clear control register
@@ -598,14 +1147,14 @@ uint8_t nfca_pcd_comm(uint16_t data_bits_num, NFCA_PCD_REC_MODE_Def mode, uint8_
 		// For large transfers, load the first 8 words (16 bytes) into the FIFO.
 		// The hardware might use DMA for the rest of the data.
 		for (int i = 0; i < 8; i++) {
-			R16_NFC_FIFO = gs_nfca_pcd_data_buf[i];
+			R16_NFC_FIFO = gs_nfca_data_buf[i];
 		}
 		g_nfca_pcd_send_fifo_bytes = 8;
 	}
 	else {
 		// For smaller transfers, load all the words into the FIFO.
 		for (int i = 0; i < num_words; i++) {
-			R16_NFC_FIFO = gs_nfca_pcd_data_buf[i];
+			R16_NFC_FIFO = gs_nfca_data_buf[i];
 		}
 		g_nfca_pcd_send_fifo_bytes = num_words;
 	}
@@ -685,6 +1234,43 @@ uint8_t nfca_pcd_lpcd_check(void) {
 	return res;
 }
 
+// NFCA PICC functions
+void nfca_picc_start() {
+	R8_NFC_CMD = 0x48;
+	R32_NFC_DRV =  (R32_NFC_DRV & 0xf9cf) | 0x620;
+	
+	R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
+	
+	R8_TMR3_CTRL_MOD = (Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56;
+	
+	R32_TMR3_CNT_END = TMR3_NFCA_PICC_CNT_END;
+	R32_TMR3_FIFO = 0;
+	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
+	R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END;
+	R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
+	
+	R8_TMR3_CTRL_MOD = ((Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+	
+	R8_TMR0_CTRL_MOD = RB_TMR_ALL_CLEAR;
+	R8_TMR0_CTRL_MOD = RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56;
+	R32_TMR0_CNT_END = TMR0_NFCA_PICC_CNT_END;
+	
+	R32_TMR0_DMA_END = R32_TMR0_DMA_NOW + 0x100;
+	R8_TMR0_INT_FLAG = RB_TMR_IF_DMA_END;
+	
+	R32_TMR0_DMA_BEG = (uint32_t)gs_nfca_picc_signal_buf;
+	R32_TMR0_DMA_END = (uint32_t)&(gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE]);
+	R8_TMR0_CTRL_DMA = RB_TMR_DMA_LOOP | RB_TMR_DMA_ENABLE;
+	
+	R8_TMR0_INT_FLAG = RB_TMR_IF_DATA_ACT;
+	R8_TMR0_INTER_EN = RB_TMR_IE_DATA_ACT;
+	
+	R8_TMR0_CTRL_MOD = (RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+	
+	NVIC_EnableIRQ(TMR3_IRQn);
+	NVIC_EnableIRQ(TMR0_IRQn);
+}
+
 // ISO 14443-3A functions
 uint16_t ISO14443_CRCA(uint8_t *buf, uint8_t len) {
 	uint8_t *data = buf;
@@ -746,13 +1332,13 @@ uint16_t PcdRequest(uint8_t req_code) {
 		
 		if((status == NFCA_PCD_CONTROLLER_STATE_DONE) || (status == NFCA_PCD_CONTROLLER_STATE_COLLISION)) {
 			if(g_nfca_pcd_recv_bits == (2 * 9)) {
-				if(ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 2)) {
+				if(ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_parity_buf, 2)) {
 					return ((uint16_t *)(g_nfca_pcd_recv_buf))[0];
 				}
 				else {
 					printf("ODD BIT ERROR\n");
 					printf("data: 0x%02x 0x%02x\n", ((uint16_t *)(g_nfca_pcd_recv_buf))[0], ((uint16_t *)(g_nfca_pcd_recv_buf))[1]);
-					printf("parity: %d %d\n", g_nfca_pcd_parity_buf[0], g_nfca_pcd_parity_buf[1]);
+					printf("parity: %d %d\n", g_nfca_parity_buf[0], g_nfca_parity_buf[1]);
 				}
 			}
 			else {
@@ -789,14 +1375,14 @@ uint16_t PcdAnticoll(uint8_t cmd) {
 	g_nfca_pcd_send_buf[1] = 0x20;
 	
 	nfca_pcd_wait_ms(PCD_ANTICOLL_OVER_TIME);
-	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_pcd_parity_buf, 2);
+	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_parity_buf, 2);
 
 	if (nfca_pcd_comm(16, NFCA_PCD_REC_MODE_NORMAL, 0) == 0) {
 		status = nfca_pcd_wait_comm_end();
 		
 		if(status == NFCA_PCD_CONTROLLER_STATE_DONE) {
 			if (g_nfca_pcd_recv_bits == (5 * 9)) {
-				if (ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 5)) {
+				if (ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_parity_buf, 5)) {
 					if (ISO14443A_CHECK_BCC(g_nfca_pcd_recv_buf)) {
 						res = PCD_NO_ERROR;
 					}
@@ -831,14 +1417,14 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr)
 	}
 	ISO14443AAppendCRCA((uint8_t *)g_nfca_pcd_send_buf, 7);
 	
-	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_pcd_parity_buf, 9);
+	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_parity_buf, 9);
 	
 	if (nfca_pcd_comm(9 * 8, NFCA_PCD_REC_MODE_NORMAL, 0) == 0) {
 		status = nfca_pcd_wait_comm_end();
 		
 		if(status == NFCA_PCD_CONTROLLER_STATE_DONE) {
 			if (g_nfca_pcd_recv_bits == (3 * 9)) {
-				if (ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_pcd_parity_buf, 3)) {
+				if (ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_parity_buf, 3)) {
 					if (ISO14443_CRCA((uint8_t *)g_nfca_pcd_recv_buf, 3) == 0) {
 						// g_m1_crypto1_cipher.is_encrypted = 0;
 						res = PCD_NO_ERROR;
@@ -868,7 +1454,7 @@ void PcdHalt(void) {
 	g_nfca_pcd_send_buf[2] = 0x57;
 	g_nfca_pcd_send_buf[3] = 0xcd;
 	
-	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_pcd_parity_buf, 4);
+	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_parity_buf, 4);
 	
 	nfca_pcd_comm((4 * 8), NFCA_PCD_REC_MODE_NORMAL, 0);
 	nfca_pcd_wait_comm_end();
@@ -877,7 +1463,6 @@ void PcdHalt(void) {
 // test
 void nfca_pcd_test() {
 	uint16_t res;
-	uint8_t picc_uid[7];
 
 	int vdd_value = ADC_VoltConverSignalPGA_MINUS_12dB( sys_get_vdd() );
 	if(vdd_value > 3400) {
@@ -947,6 +1532,10 @@ void nfca_pcd_test() {
 								if (res == PCD_NO_ERROR) {
 									printf("select OK, SAK: %02x\n", g_nfca_pcd_recv_buf[0]);
 									PcdHalt();
+
+									printf("* Found an Ultralight, switching from PCD to PICC emulation.\n");
+									nfca_pcd_stop();
+									break;
 								}
 							}
 							else {
@@ -980,12 +1569,17 @@ int main() {
 	funPinMode( LED, GPIO_CFGLR_OUT_2Mhz_PP );
 
 	printf("~ ch585 NFC ~\n");
+	printf("* Waiting for Mifare Ultralight.\n");
 	blink(5);
 	
-	funPinMode( PA4, GPIO_CFGLR_OUT_2Mhz_PP ); // Used in the IRQHandler
-	nfca_pcd_init();
-	nfca_pcd_lpcd_calibration();
-	nfca_pcd_test();
+	// nfca_init();
+	// nfca_pcd_lpcd_calibration();
+	// nfca_pcd_test(); // handles nfca_pcd_start() and _stop()
+
+	printf("* Emulating Ultralight with uid %02x %02x %02x %02x %02x %02x %02x\n",
+			picc_uid[0], picc_uid[1], picc_uid[2], picc_uid[3], picc_uid[4], picc_uid[5], picc_uid[6]);
+
+	nfca_picc_start();
 
 	while(1);
 }
