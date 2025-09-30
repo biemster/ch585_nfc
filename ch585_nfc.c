@@ -288,17 +288,22 @@ uint32_t* nfca_picc_rx_find_data(uint32_t *start_ptr, uint32_t *end_ptr, uint32_
 
 	// If the start is at or after the end, the range is invalid.
 	if (start_ptr >= end_ptr) {
+		// printf("    find_data: Invalid range, exiting.\n");
 		return NULL;
 	}
+
+	// printf("    find_data: Searching backwards from 0x%X to 0x%X for %s\n",	(unsigned)(end_ptr - 1), (unsigned)start_ptr, search_for_marker ? "MARKER" : "DATA");
 
 	// The loop starts at the word *before* end_ptr and iterates backwards down to start_ptr.
 	for (uint32_t* current_ptr = end_ptr - 1; current_ptr >= start_ptr; current_ptr--) {
 		uint32_t current_value = *current_ptr;
+		// printf("      - ptr: 0x%X, val: 0x%08X\n", (unsigned)current_ptr, (unsigned)current_value);
 
 		if (search_for_marker != 0) {
 			// Mode 1: Find a marker.
 			// If `current_value` is NOT less than `MARKER_VALUE`, we found it.
 			if (current_value >= MARKER_VALUE) {
+				// printf("    find_data: Found MARKER at 0x%X\n", (unsigned)current_ptr);
 				return current_ptr; // Success, return the pointer.
 			}
 		}
@@ -306,12 +311,14 @@ uint32_t* nfca_picc_rx_find_data(uint32_t *start_ptr, uint32_t *end_ptr, uint32_
 			// Mode 0: Find a non-marker (i.e., normal data).
 			// If `current_value` IS less than `MARKER_VALUE`, we found it.
 			if (current_value < MARKER_VALUE) {
+				// printf("    find_data: Found DATA at 0x%X\n", (unsigned)current_ptr);
 				return current_ptr; // Success, return the pointer.
 			}
 		}
 	}
 
 	// If the loop completes without finding a matching value, return NULL.
+	// printf("    find_data: Reached end of range, nothing found.\n");
 	return NULL;
 }
 
@@ -457,10 +464,11 @@ int wch_nfca_picc_wait_signal_decode(uint32_t *current_ptr, uint32_t **return_fi
 	uint8_t  current_byte_pos = 0;
 	uint8_t  current_bit_pos = 0;
 	int      decoder_state = 0;
-	uint32_t total_bits_rcvd = 0;
 
 	// Initialization.
 	g_nfca_pcd_recv_buf[0] = 0;
+
+	// printf("--- Entering Wait/Decode ---\n");
 
 	// The main processing loop.
 	for (;; current_ptr++) {
@@ -484,51 +492,59 @@ int wch_nfca_picc_wait_signal_decode(uint32_t *current_ptr, uint32_t **return_fi
 			else {
 				last_written_word = dma_now_ptr - 1;
 			}
+			// printf("wait: cur=0x%X, last=0x%X\n", (unsigned)current_ptr, (unsigned)last_written_word);
 		} while (current_ptr == last_written_word);
 
 		// Read the timestamp and immediately mark it as processed.
 		uint32_t timestamp = *current_ptr;
 		*current_ptr = PROCESSED_MARKER;
+
+		if (timestamp >= UNPROCESSED_MARKER) { // Use the base marker value for the check
+			continue;
+		}
+
 		time_accumulator += timestamp;
+
+		// printf("  ptr=0x%X, ts=0x%X, accum=0x%X\n", (unsigned)current_ptr, (unsigned)timestamp, (unsigned)time_accumulator);
 
 		// If time is too short, continue accumulating.
 		if (time_accumulator <= TIMING_THRESHOLD_BASE) {
+			// printf("  Accum < base, continuing...\n");
 			continue;
 		}
 
 		// --- State Machine for Pulse Width Decoding (similar to the other function) ---
 		uint8_t decoded_bits[2];
 		int num_bits_decoded = 0;
-		uint32_t delta = 0;
 
+		// --- START of state machine logic with prints ---
 		if (decoder_state != 0) {
-			delta = time_accumulator - TIMING_OFFSET_3; // 225
+			// printf("  In state 1, ");
+			uint32_t delta = time_accumulator - TIMING_OFFSET_3; // 225
 			if (delta <= TIMING_THRESHOLD_BASE) {
-				decoded_bits[0] = 1;
-				decoded_bits[1] = 0;
-				num_bits_decoded = 2;
+				// printf("decoded '10'\n");
+				decoded_bits[0] = 1; decoded_bits[1] = 0; num_bits_decoded = 2;
 			}
 			else {
 				delta = time_accumulator - TIMING_OFFSET_2; // 161
 				if (delta <= TIMING_THRESHOLD_BASE) {
+					// printf("decoded '01'\n");
 					decoded_bits[0] = 0;
 					decoded_bits[1] = 1;
 					num_bits_decoded = 2;
 					decoder_state = 0;
 				}
-				else { // Invalid timing
-					if (time_accumulator < UNPROCESSED_MARKER) {
-						*return_final_ptr = current_ptr;
-						return 0; // Success case with specific state
-					}
-					*return_final_ptr = current_ptr; // Store final pointer
-					return 1; // Error
+				else {
+					// printf("ERROR: Invalid timing (state 1)\n");
+					*return_final_ptr = current_ptr;
+					return 1;
 				}
 			}
-		}
-		else { // decoder_state == 0
-			delta = time_accumulator - TIMING_OFFSET_1; // 97
+		} else { // decoder_state == 0
+			// printf("  In state 0, ");
+			uint32_t delta = time_accumulator - TIMING_OFFSET_1; // 97
 			if (delta <= TIMING_THRESHOLD_BASE) {
+				// printf("decoded '1', moving to state 1\n");
 				decoded_bits[0] = 1;
 				num_bits_decoded = 1;
 				decoder_state = 1;
@@ -536,57 +552,37 @@ int wch_nfca_picc_wait_signal_decode(uint32_t *current_ptr, uint32_t **return_fi
 			else {
 				delta = time_accumulator - TIMING_OFFSET_2; // 161
 				if (delta <= TIMING_THRESHOLD_BASE) {
-					decoded_bits[0] = 0;
-					num_bits_decoded = 1;
+					// printf("decoded '0'\n");
+					decoded_bits[0] = 0; num_bits_decoded = 1;
 				}
-				else { // Invalid timing
-					if (time_accumulator < UNPROCESSED_MARKER) {
-						if (total_bits_rcvd > 0) {
-							total_bits_rcvd--;
-						}
-						*return_final_ptr = current_ptr;
-						return 0; // Success
-					}
+				else {
+					// printf("ERROR: Invalid timing (state 0)\n");
 					*return_final_ptr = current_ptr;
-					return 1; // Error
+					return 1;
 				}
 			}
 		}
+		// --- END of state machine logic with prints ---
 
-		// --- Bit Packing Logic ---
+
 		if (num_bits_decoded > 0) {
+			// printf("    Packing %d bit(s): ", num_bits_decoded);
 			for (int i = 0; i < num_bits_decoded; i++) {
 				if (current_bit_pos == 8) {
 					current_bit_pos = 0;
 					current_byte_pos++;
 					if (current_byte_pos >= NFCA_PCD_MAX_RECV_NUM) {
-						// Find the last valid non-marker pointer before returning.
-						uint32_t* final_ptr = dma_end - 1;
-						while(1) {
-							uint32_t dma_now_offset = R32_TMR0_DMA_NOW;
-							uint32_t* dma_now_ptr = (uint32_t*)(dma_now_offset | (1 << 29));
-							if (dma_now_ptr == dma_beg) {
-								final_ptr = dma_end - 1;
-							}
-							else {
-								final_ptr = dma_now_ptr - 1;
-							}
-							if (current_ptr != final_ptr) {
-								break;
-							}
-						}
-						if(*final_ptr >= UNPROCESSED_MARKER) {
-							return 1;
-						}
-						*return_final_ptr = final_ptr;
-						return 1; // Buffer full error
+						*return_final_ptr = current_ptr;
+						return 1;
 					}
 					g_nfca_pcd_recv_buf[current_byte_pos] = 0;
 				}
 				g_nfca_pcd_recv_buf[current_byte_pos] |= (decoded_bits[i] << current_bit_pos);
+				// printf("%d", decoded_bits[i]); // Print the bit being packed
 				current_bit_pos++;
 			}
-			total_bits_rcvd += num_bits_decoded;
+			// printf("\n");
+			g_nfca_pcd_recv_bits += num_bits_decoded;
 		}
 
 		time_accumulator = 0;
@@ -612,14 +608,11 @@ void TMR0_IRQHandler(void) {
 	dma_end = (uint32_t*) (R32_TMR0_DMA_END | (1 << 29));
 	dma_now = (uint32_t*) (R32_TMR0_DMA_NOW | (1 << 29));
 
-	// 0x1cd6: Check if dma_beg == dma_now
 	if (dma_beg == dma_now) {
 		search_ptr = dma_end - 1; // Corresponds to addi s0, s2, -4
 	}
 	else {
-		// 0x1cda: Check if dma_now < dma_end
 		if ((uintptr_t)dma_now < (uintptr_t)dma_end) {
-			// 0x1d10: Check if dma_beg >= dma_now
 			if ((uintptr_t)dma_beg >= (uintptr_t)dma_now) {
 				goto reset_timer_and_exit;
 			}
@@ -629,12 +622,25 @@ void TMR0_IRQHandler(void) {
 			search_ptr = dma_now;
 		}
 	}
+	
+	//printf("DMA Pointers: NOW=0x%08X, BEG=0x%08X, END=0xx%08X\n", (unsigned int)dma_now, (unsigned int)dma_beg, (unsigned int)dma_end);
+	//printf("Search Ptr Value: *search_ptr = 0x%08X\n", (unsigned int)*search_ptr);
+	printf("  Recent Timestamps: ");
+	for (int i = 0; i < 8; i++) {
+		uint32_t* ptr = search_ptr - i;
+		if (ptr < dma_beg) {
+			ptr = dma_end - (dma_beg - ptr);
+		}
+		printf("0x%X ", (unsigned int)*ptr);
+	}
+	printf("\n");
 
 	// Main logic starts here, corresponds to LAB_00001d16
 	val = *search_ptr;
 
 	// Check if the value at search_ptr is a special value (>= 0x20000000)
 	if (val >= 0x20000000) {
+		// printf("Taking SPECIAL value path.\n");
 		// --- Logic for handling special value (>= 0x20000000) ---
 		// This part of the code seems to reconfigure the timer and search for data differently.
 		R8_TMR0_CTRL_DMA = 0; // Disable DMA
@@ -733,11 +739,15 @@ void TMR0_IRQHandler(void) {
 		}
 	}
 	else {
+		// printf("Taking NORMAL value path.\n");
 		// --- Logic for handling normal value (< 0x20000000) ---
+		// printf("  find_data(1) params: start=0x%X, end=0x%X\n", (unsigned)dma_beg, (unsigned)search_ptr);
 		data_ptr = nfca_picc_rx_find_data(dma_beg, search_ptr, 1);
 		if (!data_ptr) {
+			// printf("  find_data(2) params: start=0x%X, end=0x%X\n", (unsigned)(search_ptr + 1), (unsigned)dma_end);
 			data_ptr = nfca_picc_rx_find_data(search_ptr + 1, dma_end, 1);
 			if (!data_ptr) {
+				// printf("No data found\n");
 				goto reset_timer_and_exit;
 			}
 		}
@@ -768,6 +778,7 @@ void TMR0_IRQHandler(void) {
 			next_ptr = dma_beg;
 		}
 
+		// printf("*next_ptr = 0x%08X\n", (unsigned int)*next_ptr);
 		if (*(next_ptr) >= 0x20000000) {
 			goto reset_timer_and_exit;
 		}
@@ -1244,35 +1255,40 @@ uint8_t nfca_pcd_lpcd_check(void) {
 void nfca_picc_start() {
 	R8_NFC_CMD = 0x48;
 	R32_NFC_DRV =  (R32_NFC_DRV & 0xf9cf) | 0x620;
-	
+
 	R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
-	
+
 	R8_TMR3_CTRL_MOD = (Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56;
-	
+
 	R32_TMR3_CNT_END = TMR3_NFCA_PICC_CNT_END;
 	R32_TMR3_FIFO = 0;
 	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
 	R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END;
 	R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-	
+
 	R8_TMR3_CTRL_MOD = ((Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
-	
+
 	R8_TMR0_CTRL_MOD = RB_TMR_ALL_CLEAR;
 	R8_TMR0_CTRL_MOD = RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56;
 	R32_TMR0_CNT_END = TMR0_NFCA_PICC_CNT_END;
-	
+
 	R32_TMR0_DMA_END = R32_TMR0_DMA_NOW + 0x100;
 	R8_TMR0_INT_FLAG = RB_TMR_IF_DMA_END;
-	
+
 	R32_TMR0_DMA_BEG = (uint32_t)gs_nfca_picc_signal_buf;
 	R32_TMR0_DMA_END = (uint32_t)&(gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE]);
 	R8_TMR0_CTRL_DMA = RB_TMR_DMA_LOOP | RB_TMR_DMA_ENABLE;
-	
+
 	R8_TMR0_INT_FLAG = RB_TMR_IF_DATA_ACT;
 	R8_TMR0_INTER_EN = RB_TMR_IE_DATA_ACT;
-	
+
 	R8_TMR0_CTRL_MOD = (RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
-	
+
+	const uint32_t UNPROCESSED_MARKER = 0x20000000;
+	for (int i = 0; i < NFCA_PICC_SIGNAL_BUF_SIZE; i++) {
+		gs_nfca_picc_signal_buf[i] = UNPROCESSED_MARKER;
+	}
+
 	NVIC_EnableIRQ(TMR3_IRQn);
 	NVIC_EnableIRQ(TMR0_IRQn);
 }
