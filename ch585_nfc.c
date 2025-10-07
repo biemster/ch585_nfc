@@ -300,7 +300,28 @@ void TMR0_IRQHandler(void) {
 				gs_nfca_data_buf[g_picc_data_idx++] = (uint16_t)value_from_dma;
 			}
 			else if(gs_nfca_data_buf[g_picc_data_idx -1] != 0xFFFF) {
-				gs_nfca_data_buf[g_picc_data_idx++] = 0xFFFF;
+				// don't write pulse trains less than 7 bits, overwrite that last one on next trigger
+				if(gs_nfca_data_buf[g_picc_data_idx -2] == 0xFFFF) {
+					g_picc_data_idx -= 1;
+				}
+				else if(gs_nfca_data_buf[g_picc_data_idx -3] == 0xFFFF) {
+					g_picc_data_idx -= 2;
+				}
+				else if(gs_nfca_data_buf[g_picc_data_idx -4] == 0xFFFF) {
+					g_picc_data_idx -= 3;
+				}
+				else if(gs_nfca_data_buf[g_picc_data_idx -5] == 0xFFFF) {
+					g_picc_data_idx -= 4;
+				}
+				else if(gs_nfca_data_buf[g_picc_data_idx -6] == 0xFFFF) {
+					g_picc_data_idx -= 5;
+				}
+				else if(gs_nfca_data_buf[g_picc_data_idx -7] == 0xFFFF) {
+					g_picc_data_idx -= 6;
+				}
+				else {
+					gs_nfca_data_buf[g_picc_data_idx++] = 0xFFFF;
+				}
 			}
 		}
 
@@ -1035,6 +1056,55 @@ void nfca_pcd_test() {
 	}
 }
 
+// For NFC at 106 kbps, 1 ETU is ~128 / 13.56 MHz = ~9.44 us.
+#define ETU         128
+#define ETU_TOLERANCE   16
+
+static inline int is_close(uint16_t val, uint16_t target, uint16_t tol) {
+    uint16_t diff = (val > target) ? (val - target) : (target - val);
+    return diff < tol;
+}
+
+int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
+	int8_t bit_idx = 0;
+	result_buf[bit_idx++] = '0'; // Initial state starts with a '0' bit
+
+	for (int i = 0; i < len; ++i) {
+		uint8_t last_bit = result_buf[bit_idx - 1];
+		uint16_t pulse = pulses[i];
+
+		if (last_bit == '0') {
+			if (is_close(pulse, ETU, ETU_TOLERANCE)) {
+				result_buf[bit_idx++] = '0';
+			}
+			else if (is_close(pulse, (ETU * 3 / 2), ETU_TOLERANCE)) { // 1.5 * ETU
+				result_buf[bit_idx++] = '1';
+			}
+			else {
+				return -1;
+			}
+		}
+		else { // last_bit == '1'
+			if (is_close(pulse, ETU, ETU_TOLERANCE)) {
+				result_buf[bit_idx++] = '1';
+			}
+			else if (is_close(pulse, (ETU * 3 / 2), ETU_TOLERANCE)) { // 1.5 * ETU
+				result_buf[bit_idx++] = '0';
+				result_buf[bit_idx++] = '0';
+			}
+			else if (is_close(pulse, (ETU * 2), ETU_TOLERANCE)) { // 2.0 * ETU
+				result_buf[bit_idx++] = '0';
+				result_buf[bit_idx++] = '1';
+			}
+			else {
+				return -1;
+			}
+		}
+	}
+
+	return bit_idx; // Return the number of bits decoded
+}
+
 int main() {
 	SystemInit();
 
@@ -1053,21 +1123,26 @@ int main() {
 	printf("* Emulating Ultralight with uid %02x %02x %02x %02x %02x %02x %02x\n",
 			picc_uid[0], picc_uid[1], picc_uid[2], picc_uid[3], picc_uid[4], picc_uid[5], picc_uid[6]);
 
+	uint16_t pcd_pulses[NFCA_DATA_BUF_SIZE] = {0};
+	uint8_t pcd_req[NFCA_DATA_BUF_SIZE] = {0};
 	nfca_picc_start();
 
 	while(1) {
-		if(g_picc_data_idx == NFCA_DATA_BUF_SIZE) {
-			printf("pulses: [");
-			for(int i = 0; i < NFCA_DATA_BUF_SIZE; i++) {
+		if(g_picc_data_idx > 7) {
+			NVIC_DisableIRQ(TMR0_IRQn);
+			int buf_copy_idx = 0;
+			for(int i = 0; i < g_picc_data_idx; i++) {
 				if(gs_nfca_data_buf[i] < 0xFFFF) {
-					printf("%d:%d ", i, gs_nfca_data_buf[i]);
-				}
-				else {
-					printf("]\npulses: [");
+					pcd_pulses[buf_copy_idx++] = gs_nfca_data_buf[i];
 				}
 			}
-			printf("]\n");
-			while(1);
+
+			// first pulse is some initializer, discard that
+			int req_len = decode_pulses_to_bits(&pcd_pulses[1], /*len=*/buf_copy_idx -1, pcd_req);
+			printf("req(%d): %s\n", req_len, pcd_req);
+
+			g_picc_data_idx = 0;
+			NVIC_EnableIRQ(TMR0_IRQn);
 		}
 	}
 }
