@@ -1057,12 +1057,22 @@ void nfca_pcd_test() {
 }
 
 // For NFC at 106 kbps, 1 ETU is ~128 / 13.56 MHz = ~9.44 us.
-#define ETU         128
-#define ETU_TOLERANCE   16
+#define ETU           128
+#define ETU_TOLERANCE 16
 
 static inline int is_close(uint16_t val, uint16_t target, uint16_t tol) {
-    uint16_t diff = (val > target) ? (val - target) : (target - val);
-    return diff < tol;
+	uint16_t diff = (val > target) ? (val - target) : (target - val);
+	return diff < tol;
+}
+
+static inline uint8_t bits_to_byte(uint8_t bit_str[]) {
+	uint8_t byte_val = 0;
+	for (int i = 0; i < 8; ++i) {
+		if (bit_str[i] == '1') {
+			byte_val |= (1 << i);
+		}
+	}
+	return byte_val;
 }
 
 int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
@@ -1137,9 +1147,12 @@ int main() {
 				}
 			}
 
+			memset(pcd_req, 0, sizeof(pcd_req));
 			// first pulse is some initializer, discard that
 			int req_len = decode_pulses_to_bits(&pcd_pulses[1], /*len=*/buf_copy_idx -1, pcd_req);
 			printf("req(%d): %s\n", req_len, pcd_req);
+			uint8_t b = bits_to_byte(pcd_req);
+			printf("cmd: 0x%02x\n", b >> 1); // discard SOF 0 first bit
 
 			g_picc_data_idx = 0;
 			NVIC_EnableIRQ(TMR0_IRQn);
