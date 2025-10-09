@@ -1065,6 +1065,16 @@ static inline int is_close(uint16_t val, uint16_t target, uint16_t tol) {
 	return diff < tol;
 }
 
+static inline uint8_t check_parity(uint8_t bit_str[]) {
+	char expected = '1';
+	for(int i = 0; i < 8; i++) {
+		if(bit_str[i] == '1') {
+			expected = (expected == '1') ? '0' : '1';
+		}
+	}
+	return (bit_str[8] == expected) ? 1 : 0;
+}
+
 static inline uint8_t bits_to_byte(uint8_t bit_str[]) {
 	uint8_t byte_val = 0;
 	for (int i = 0; i < 8; ++i) {
@@ -1073,6 +1083,28 @@ static inline uint8_t bits_to_byte(uint8_t bit_str[]) {
 		}
 	}
 	return byte_val;
+}
+
+static inline uint8_t bits_to_frame(uint8_t bit_str[], int len) {
+	uint8_t num_bytes = 0;
+	if(bit_str[0] != '0' || bit_str[len -1] != '0') {
+		printf("* ERROR in bits_to_frame: SOF/EOF not zero\n");
+	}
+	else if((len -2) % 9) { // frame len is 9 bits per byte, + SOF,EOF
+		printf("* ERROR in bits_to_frame: bit string is incomplete\n");
+	}
+	else {
+		for(int i = 1; i < (len -1); i += 9) {
+			if(check_parity(&bit_str[i])) {
+				bit_str[num_bytes++] = bits_to_byte(&bit_str[i]);
+			}
+			else {
+				printf("* ERROR in bits_to_frame: wrong parity of byte at index %d\n", i);
+			}
+		}
+	}
+
+	return num_bytes;
 }
 
 int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
@@ -1139,6 +1171,12 @@ int main() {
 
 	while(1) {
 		if(g_picc_data_idx > 7) {
+			uint32_t npulses = g_picc_data_idx;
+			Delay_Us(50); // wait 5 et_u to see if there are more pulses incoming
+			if (g_picc_data_idx > npulses) {
+				continue;
+			}
+
 			NVIC_DisableIRQ(TMR0_IRQn);
 			int buf_copy_idx = 0;
 			for(int i = 0; i < g_picc_data_idx; i++) {
@@ -1151,8 +1189,22 @@ int main() {
 			// first pulse is some initializer, discard that
 			int req_len = decode_pulses_to_bits(&pcd_pulses[1], /*len=*/buf_copy_idx -1, pcd_req);
 			printf("req(%d): %s\n", req_len, pcd_req);
-			uint8_t b = bits_to_byte(pcd_req);
-			printf("cmd: 0x%02x\n", b >> 1); // discard SOF 0 first bit
+
+			if(pcd_req[0] != '0' || pcd_req[req_len -1] != '0') {
+				printf("* ERROR: SOF/EOF not zero\n");
+			}
+			else if(req_len == 9) { // short frame
+				uint8_t b = bits_to_byte(pcd_req);
+				printf("cmd: 0x%02x\n", b >> 1); // discard EOF 0 last bit
+			}
+			else { // normal frame, need to check parity bits
+				uint8_t frame_len = bits_to_frame(pcd_req, req_len); // pcd_req is reused as output
+				printf("frame: [%02x", pcd_req[0]);
+				for(int i = 1; i < frame_len; i++) {
+					printf(" %02x", pcd_req[i]);
+				}
+				printf("]\n");
+			}
 
 			g_picc_data_idx = 0;
 			NVIC_EnableIRQ(TMR0_IRQn);
