@@ -13,11 +13,14 @@
 
 #define RB_TMR_FREQ_13_56             0x20
 #define TMR0_NFCA_PICC_CNT_END        288
-#define TMR3_NFCA_PICC_CNT_END        18
+#define TMR3_NFCA_PICC_CNT_END        16 // picc -> pcd freq is 13.56 / 16
+#define TMR3_CTRL_PWM_ON  (TMR3_NFCA_PICC_CNT_END /2)
+#define TMR3_CTRL_PWM_OFF 0
 
 
 #define NFCA_DATA_BUF_SIZE                       512
 #define NFCA_PICC_SIGNAL_BUF_SIZE                512
+#define NFCA_PICC_TX_BUF_SIZE                    512
 #define NFCA_PCD_MAX_SEND_NUM                    (NFCA_DATA_BUF_SIZE)
 #define NFCA_PCD_MAX_RECV_NUM                    (NFCA_DATA_BUF_SIZE * 16 / 9)
 #define NFCA_MAX_PARITY_NUM                      (NFCA_PCD_MAX_RECV_NUM)
@@ -49,6 +52,7 @@ __attribute__((aligned(4))) uint8_t g_nfca_parity_buf[NFCA_MAX_PARITY_NUM];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE];
+__attribute__((aligned(4))) static uint8_t gs_nfca_picc_tx_buf[NFCA_PICC_TX_BUF_SIZE];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
 uint8_t picc_uid[7];
 
@@ -334,14 +338,21 @@ void TMR0_IRQHandler(void) {
 
 __INTERRUPT
 __HIGH_CODE
-void TMR3_IRQHandler(void){
-	R8_TMR3_CTRL_DMA = 0;
-	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
-	R32_TMR0_CNT_END = 0x120;
-	R8_TMR0_CTRL_DMA = 5;
-	R8_TMR0_CTRL_MOD = 0xe5;
+void TMR3_IRQHandler(void) {
+	uint8_t status = R8_TMR3_INT_FLAG;
+	R8_TMR3_INT_FLAG = status; // Acknowledge
 
-	NVIC_ClearPendingIRQ(TMR0_IRQn);
+	if (status & RB_TMR_IF_DMA_END) {
+		R8_TMR3_INT_FLAG &= ~RB_TMR_IF_DMA_END; // Clear the flag
+		R8_TMR3_CTRL_DMA = 0; // Disable TMR3 DMA trigger
+		R8_TMR3_INTER_EN = 0;
+
+		// Set modulation pin back to high-impedance input
+		funPinMode( (PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
+		printf("TMR3_IF_DMA_END\n");
+	}
+
+	NVIC_ClearPendingIRQ(TMR3_IRQn);
 }
 
 uint16_t sys_get_vdd(void) {
@@ -376,8 +387,8 @@ int ADC_VoltConverSignalPGA_MINUS_12dB(uint16_t adc_data) {
 void nfca_init() {
 	funPinMode( (PB8 | PB9 | PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 	
-	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB)<< 16);
-	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8);
+	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB) << 16); // disable PB8 PB9 digital input
+	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8); // disable PB16 PB17 digital input?
 }
 
 // NFCA PCD functions
@@ -522,10 +533,8 @@ uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t num_bits, uin
 	int32_t bytes_processed;
 
 	// The main loop processes one output byte per iteration.
-	// This corresponds to the loop between LAB_00001068 and LAB_000010b6.
 	for (bytes_processed = 0; bytes_processed < output_len; ++bytes_processed) {
 		// Stop if there aren't enough bits left for a full 9-bit packet.
-		// The assembly checks this with 'num_bits' (bss_10e).
 		if (bits_remaining < 9) {
 			break;
 		}
@@ -548,11 +557,9 @@ uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t num_bits, uin
 		uint16_t nine_bit_packet = (combined_words >> bit_pos_in_word) & 0x1FF;
 
 		// The lower 8 bits are the data byte.
-		// Corresponds to 'sra' and 'andi' at 0x1072-0x1076.
 		recv_buf[bytes_processed] = (uint8_t)(nine_bit_packet & 0xFF);
 
 		// The 9th bit is the parity bit.
-		// Corresponds to the 'sbext' instruction at 0x1090.
 		parity_buf[bytes_processed] = (uint8_t)((nine_bit_packet >> 8) & 0x01);
 
 		// Advance the bit position by 9 for the next iteration.
@@ -560,8 +567,6 @@ uint32_t nfca_pcd_separate_recv_data(uint16_t data_buf[], uint16_t num_bits, uin
 		bits_remaining -= 9;
 	}
 
-	// The function returns the number of bytes processed, which is in register a0
-	// at the end of the assembly code.
 	return bytes_processed;
 }
 
@@ -734,18 +739,6 @@ void nfca_picc_start() {
 	R8_NFC_CMD = 0x48;
 	R32_NFC_DRV =  (R32_NFC_DRV & 0xf9cf) | 0x620;
 
-	R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
-
-	R8_TMR3_CTRL_MOD = (Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56;
-
-	R32_TMR3_CNT_END = TMR3_NFCA_PICC_CNT_END;
-	R32_TMR3_FIFO = 0;
-	R32_TMR3_DMA_END = R32_TMR3_DMA_NOW + 0x100;
-	R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END;
-	R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-
-	R8_TMR3_CTRL_MOD = ((Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
-
 	R8_TMR0_CTRL_MOD = RB_TMR_ALL_CLEAR;
 	R8_TMR0_CTRL_MOD = RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56;
 	R32_TMR0_CNT_END = TMR0_NFCA_PICC_CNT_END;
@@ -762,7 +755,6 @@ void nfca_picc_start() {
 
 	R8_TMR0_CTRL_MOD = (RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
 
-	NVIC_EnableIRQ(TMR3_IRQn);
 	NVIC_EnableIRQ(TMR0_IRQn);
 }
 
@@ -1147,6 +1139,69 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 	return bit_idx; // Return the number of bits decoded
 }
 
+static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
+	uint16_t dma_idx = 0;
+	uint8_t parity;
+
+	// Start of Frame (SOF) - a '0' pattern
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+
+	for (uint8_t i = 0; i < num_bytes; i++) {
+		uint8_t current_byte = data[i];
+		parity = 0;
+
+		// 8 data bits
+		for (uint8_t j = 0; j < 8; j++) {
+			uint8_t bit = (current_byte >> j) & 1;
+			parity ^= bit;
+			if (bit) { // '1' bit (Low then High subcarrier)
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+			}
+			else { // '0' bit (High then Low subcarrier)
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+			}
+		}
+
+		// Parity bit (odd parity)
+		if (parity) { // Parity is 1, send a '0' bit to make total odd
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+		} else { // Parity is 0, send a '1' bit
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+		}
+	}
+	return dma_idx;
+}
+
+void wch_nfca_picc_send_bits(uint8_t *data, uint8_t num_bytes) {
+	// Encode the data into the DMA buffer format
+	uint16_t dma_len = nfca_manchester_encode(data, num_bytes);
+	// printf("tx dma_len %d\n", dma_len);
+	R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
+
+	R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
+
+	R32_TMR3_DMA_BEG = (uint32_t)gs_nfca_picc_tx_buf;
+	R32_TMR3_DMA_NOW = R32_TMR3_DMA_BEG;
+	R32_TMR3_DMA_END = R32_TMR3_DMA_BEG +dma_len;
+
+	R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear DMA end flag
+	R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
+
+	funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_2Mhz_PP );
+
+	R32_TMR3_CNT_END = TMR3_NFCA_PICC_CNT_END;
+	R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
+
+	// Start the timer, which starts the whole DMA-driven transmission process
+	NVIC_EnableIRQ(TMR3_IRQn);
+	R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+}
+
 int main() {
 	SystemInit();
 
@@ -1158,7 +1213,7 @@ int main() {
 	printf("* Waiting for Mifare Ultralight.\n");
 	blink(5);
 	
-	// nfca_init();
+	nfca_init();
 	// nfca_pcd_lpcd_calibration();
 	// nfca_pcd_test(); // handles nfca_pcd_start() and _stop()
 
@@ -1188,14 +1243,18 @@ int main() {
 			memset(pcd_req, 0, sizeof(pcd_req));
 			// first pulse is some initializer, discard that
 			int req_len = decode_pulses_to_bits(&pcd_pulses[1], /*len=*/buf_copy_idx -1, pcd_req);
-			printf("req(%d): %s\n", req_len, pcd_req);
+			// printf("req(%d): %s\n", req_len, pcd_req);
 
 			if(pcd_req[0] != '0' || pcd_req[req_len -1] != '0') {
 				printf("* ERROR: SOF/EOF not zero\n");
 			}
 			else if(req_len == 9) { // short frame
-				uint8_t b = bits_to_byte(pcd_req);
-				printf("cmd: 0x%02x\n", b >> 1); // discard EOF 0 last bit
+				uint8_t cmd = bits_to_byte(&pcd_req[1]); // discard SOF
+				// printf("cmd: 0x%02x\n", cmd);
+				if((cmd == 0x26) || (cmd == 0x52)) {
+					uint8_t ATQA[] = {0x44, 0x00};
+					wch_nfca_picc_send_bits(ATQA, sizeof(ATQA));
+				}
 			}
 			else { // normal frame, need to check parity bits
 				uint8_t frame_len = bits_to_frame(pcd_req, req_len); // pcd_req is reused as output
