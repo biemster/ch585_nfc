@@ -13,9 +13,9 @@
 
 #define RB_TMR_FREQ_13_56             0x20
 #define TMR0_NFCA_PICC_CNT_END        288
-#define TMR3_NFCA_PICC_CNT_END        16 // picc -> pcd freq is 13.56 / 16
+#define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
 #define TMR3_CTRL_PWM_ON  (TMR3_NFCA_PICC_CNT_END /2)
-#define TMR3_CTRL_PWM_OFF 0
+#define TMR3_CTRL_PWM_OFF TMR3_NFCA_PICC_CNT_END
 
 
 #define NFCA_DATA_BUF_SIZE                       512
@@ -52,7 +52,7 @@ __attribute__((aligned(4))) uint8_t g_nfca_parity_buf[NFCA_MAX_PARITY_NUM];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE];
-__attribute__((aligned(4))) static uint8_t gs_nfca_picc_tx_buf[NFCA_PICC_TX_BUF_SIZE];
+__attribute__((aligned(4))) static uint32_t gs_nfca_picc_tx_buf[NFCA_PICC_TX_BUF_SIZE];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
 uint8_t picc_uid[7];
 
@@ -288,6 +288,7 @@ void NFC_IRQHandler(void) {
 	}
 }
 
+void wch_nfca_picc_send_bits(uint8_t*, uint8_t);
 __INTERRUPT
 __HIGH_CODE
 void TMR0_IRQHandler(void) {
@@ -304,7 +305,7 @@ void TMR0_IRQHandler(void) {
 				gs_nfca_data_buf[g_picc_data_idx++] = (uint16_t)value_from_dma;
 			}
 			else if(gs_nfca_data_buf[g_picc_data_idx -1] != 0xFFFF) {
-				// don't write pulse trains less than 7 bits, overwrite that last one on next trigger
+				// don't write pulse trains less than 6 bits (WUPA), overwrite that last one on next trigger
 				if(gs_nfca_data_buf[g_picc_data_idx -2] == 0xFFFF) {
 					g_picc_data_idx -= 1;
 				}
@@ -320,9 +321,6 @@ void TMR0_IRQHandler(void) {
 				else if(gs_nfca_data_buf[g_picc_data_idx -6] == 0xFFFF) {
 					g_picc_data_idx -= 5;
 				}
-				else if(gs_nfca_data_buf[g_picc_data_idx -7] == 0xFFFF) {
-					g_picc_data_idx -= 6;
-				}
 				else {
 					gs_nfca_data_buf[g_picc_data_idx++] = 0xFFFF;
 				}
@@ -334,6 +332,14 @@ void TMR0_IRQHandler(void) {
 	}
 
 	NVIC_ClearPendingIRQ(TMR0_IRQn);
+
+	if(g_picc_data_idx == 7 || g_picc_data_idx == 8) { // WUPA || REQA
+		NVIC_DisableIRQ(TMR0_IRQn);
+		uint8_t ATQA[] = {0x44, 0x00};
+		wch_nfca_picc_send_bits(ATQA, sizeof(ATQA));
+		g_picc_data_idx = 0;
+		NVIC_EnableIRQ(TMR0_IRQn);
+	}
 }
 
 __INTERRUPT
@@ -347,9 +353,8 @@ void TMR3_IRQHandler(void) {
 		R8_TMR3_CTRL_DMA = 0; // Disable TMR3 DMA trigger
 		R8_TMR3_INTER_EN = 0;
 
-		// Set modulation pin back to high-impedance input
-		funPinMode( (PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
-		printf("TMR3_IF_DMA_END\n");
+		funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_10Mhz_PP );
+		printf("TMR3_IF_DMA_END (finished PICC->PCD)\n");
 	}
 
 	NVIC_ClearPendingIRQ(TMR3_IRQn);
@@ -385,7 +390,8 @@ int ADC_VoltConverSignalPGA_MINUS_12dB(uint16_t adc_data) {
 }
 
 void nfca_init() {
-	funPinMode( (PB8 | PB9 | PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
+	funPinMode( (PB8 | PB9), GPIO_CFGLR_IN_FLOAT );
+	funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_10Mhz_PP );
 	
 	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB) << 16); // disable PB8 PB9 digital input
 	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8); // disable PB16 PB17 digital input?
@@ -1144,6 +1150,7 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 	uint8_t parity;
 
 	// Start of Frame (SOF) - a '0' pattern
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 
@@ -1156,24 +1163,31 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 			uint8_t bit = (current_byte >> j) & 1;
 			parity ^= bit;
 			if (bit) { // '1' bit (Low then High subcarrier)
-				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 			}
 			else { // '0' bit (High then Low subcarrier)
-				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 			}
 		}
 
 		// Parity bit (odd parity)
 		if (parity) { // Parity is 1, send a '0' bit to make total odd
-			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 		} else { // Parity is 0, send a '1' bit
-			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
+			gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 		}
 	}
+
+	for( uint8_t i = 0; i < 5; i++) {
+		// give the NFC peripheral some time to push out the bytes,
+		// the TMR3 isr will switch on the coil when DMA signalled END
+		gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+	}
+
 	return dma_idx;
 }
 
@@ -1186,20 +1200,21 @@ void wch_nfca_picc_send_bits(uint8_t *data, uint8_t num_bytes) {
 	R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
 
 	R32_TMR3_DMA_BEG = (uint32_t)gs_nfca_picc_tx_buf;
-	R32_TMR3_DMA_NOW = R32_TMR3_DMA_BEG;
-	R32_TMR3_DMA_END = R32_TMR3_DMA_BEG +dma_len;
+	R32_TMR3_DMA_END = (uint32_t)&gs_nfca_picc_tx_buf[dma_len +1];
 
 	R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear DMA end flag
 	R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-
-	funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_2Mhz_PP );
 
 	R32_TMR3_CNT_END = TMR3_NFCA_PICC_CNT_END;
 	R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
 
 	// Start the timer, which starts the whole DMA-driven transmission process
 	NVIC_EnableIRQ(TMR3_IRQn);
-	R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (Low_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+	R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (High_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+
+	// Set modulation pins to high-impedance input after a tiny wait,
+	// the NFC peripheral needs some time to start pushing bits
+	funPinMode( (PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 }
 
 int main() {
@@ -1250,7 +1265,6 @@ int main() {
 			}
 			else if(req_len == 9) { // short frame
 				uint8_t cmd = bits_to_byte(&pcd_req[1]); // discard SOF
-				// printf("cmd: 0x%02x\n", cmd);
 				if((cmd == 0x26) || (cmd == 0x52)) {
 					uint8_t ATQA[] = {0x44, 0x00};
 					wch_nfca_picc_send_bits(ATQA, sizeof(ATQA));
