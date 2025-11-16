@@ -1151,6 +1151,7 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 
 	// Start of Frame (SOF) - a '0' pattern
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 
@@ -1182,7 +1183,7 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 		}
 	}
 
-	for( uint8_t i = 0; i < 5; i++) {
+	for( uint8_t i = 0; i < 7; i++) {
 		// give the NFC peripheral some time to push out the bytes,
 		// the TMR3 isr will switch on the coil when DMA signalled END
 		gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
@@ -1214,6 +1215,8 @@ void wch_nfca_picc_send_bits(uint8_t *data, uint8_t num_bytes) {
 
 	// Set modulation pins to high-impedance input after a tiny wait,
 	// the NFC peripheral needs some time to start pushing bits
+	// maybe there is a register bit for this?
+	Delay_Us(5);
 	funPinMode( (PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 }
 
