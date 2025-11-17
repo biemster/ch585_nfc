@@ -14,9 +14,8 @@
 #define RB_TMR_FREQ_13_56             0x20
 #define TMR0_NFCA_PICC_CNT_END        288
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
-#define TMR3_CTRL_PWM_ON  (TMR3_NFCA_PICC_CNT_END /2)
-#define TMR3_CTRL_PWM_OFF TMR3_NFCA_PICC_CNT_END
-
+#define TMR3_CTRL_PWM_ON  ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
+#define TMR3_CTRL_PWM_OFF 0
 
 #define NFCA_DATA_BUF_SIZE                       512
 #define NFCA_PICC_SIGNAL_BUF_SIZE                512
@@ -305,7 +304,7 @@ void TMR0_IRQHandler(void) {
 				gs_nfca_data_buf[g_picc_data_idx++] = (uint16_t)value_from_dma;
 			}
 			else if(gs_nfca_data_buf[g_picc_data_idx -1] != 0xFFFF) {
-				// don't write pulse trains less than 6 bits (WUPA), overwrite that last one on next trigger
+				// don't write pulse trains less than 5 bits (WUPA), overwrite that last one on next trigger
 				if(gs_nfca_data_buf[g_picc_data_idx -2] == 0xFFFF) {
 					g_picc_data_idx -= 1;
 				}
@@ -317,9 +316,6 @@ void TMR0_IRQHandler(void) {
 				}
 				else if(gs_nfca_data_buf[g_picc_data_idx -5] == 0xFFFF) {
 					g_picc_data_idx -= 4;
-				}
-				else if(gs_nfca_data_buf[g_picc_data_idx -6] == 0xFFFF) {
-					g_picc_data_idx -= 5;
 				}
 				else {
 					gs_nfca_data_buf[g_picc_data_idx++] = 0xFFFF;
@@ -333,13 +329,23 @@ void TMR0_IRQHandler(void) {
 
 	NVIC_ClearPendingIRQ(TMR0_IRQn);
 
-	if(g_picc_data_idx == 7 || g_picc_data_idx == 8) { // WUPA || REQA
-		NVIC_DisableIRQ(TMR0_IRQn);
+	NVIC_DisableIRQ(TMR0_IRQn);
+	switch(g_picc_data_idx) {
+	case 5: // REQA
+	case 8: // WUPA
 		uint8_t ATQA[] = {0x44, 0x00};
 		wch_nfca_picc_send_bits(ATQA, sizeof(ATQA));
 		g_picc_data_idx = 0;
-		NVIC_EnableIRQ(TMR0_IRQn);
+		break;
+	default:
+		if(g_picc_data_idx > 8) {
+//			uint8_t RESP[] = {g_picc_data_idx, 0x00};
+//			wch_nfca_picc_send_bits(RESP, sizeof(RESP));
+			g_picc_data_idx = 0;
+		}
+		break;
 	}
+	NVIC_EnableIRQ(TMR0_IRQn);
 }
 
 __INTERRUPT
@@ -353,7 +359,6 @@ void TMR3_IRQHandler(void) {
 		R8_TMR3_CTRL_DMA = 0; // Disable TMR3 DMA trigger
 		R8_TMR3_INTER_EN = 0;
 
-		funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_10Mhz_PP );
 		printf("TMR3_IF_DMA_END (finished PICC->PCD)\n");
 	}
 
@@ -390,8 +395,7 @@ int ADC_VoltConverSignalPGA_MINUS_12dB(uint16_t adc_data) {
 }
 
 void nfca_init() {
-	funPinMode( (PB8 | PB9), GPIO_CFGLR_IN_FLOAT );
-	funPinMode( (PB16 | PB17), GPIO_CFGLR_OUT_10Mhz_PP );
+	funPinMode( (PB8 | PB9 | PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 	
 	R32_PIN_IN_DIS |= (((PB8 | PB9) & ~PB) << 16); // disable PB8 PB9 digital input
 	R16_PIN_CONFIG |= (((PB16 | PB17) & ~PB) >> 8); // disable PB16 PB17 digital input?
@@ -762,6 +766,7 @@ void nfca_picc_start() {
 	R8_TMR0_CTRL_MOD = (RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
 
 	NVIC_EnableIRQ(TMR0_IRQn);
+	NVIC_EnableIRQ(TMR3_IRQn); // for tx
 }
 
 // ISO 14443-3A functions
@@ -1149,8 +1154,7 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 	uint16_t dma_idx = 0;
 	uint8_t parity;
 
-	// Start of Frame (SOF) - a '0' pattern
-	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+	// Start of Frame (SOF) - a '0' pattern (with an extra OFF in front to please TMR3)
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
@@ -1183,11 +1187,9 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 		}
 	}
 
-	for( uint8_t i = 0; i < 7; i++) {
-		// give the NFC peripheral some time to push out the bytes,
-		// the TMR3 isr will switch on the coil when DMA signalled END
-		gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
-	}
+	// End of Frame
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 
 	return dma_idx;
 }
@@ -1195,7 +1197,6 @@ static uint16_t nfca_manchester_encode(const uint8_t *data, uint8_t num_bytes) {
 void wch_nfca_picc_send_bits(uint8_t *data, uint8_t num_bytes) {
 	// Encode the data into the DMA buffer format
 	uint16_t dma_len = nfca_manchester_encode(data, num_bytes);
-	// printf("tx dma_len %d\n", dma_len);
 	R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
 
 	R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
@@ -1210,14 +1211,7 @@ void wch_nfca_picc_send_bits(uint8_t *data, uint8_t num_bytes) {
 	R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
 
 	// Start the timer, which starts the whole DMA-driven transmission process
-	NVIC_EnableIRQ(TMR3_IRQn);
 	R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (High_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
-
-	// Set modulation pins to high-impedance input after a tiny wait,
-	// the NFC peripheral needs some time to start pushing bits
-	// maybe there is a register bit for this?
-	Delay_Us(5);
-	funPinMode( (PB16 | PB17), GPIO_CFGLR_IN_FLOAT );
 }
 
 int main() {
