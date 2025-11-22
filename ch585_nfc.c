@@ -12,15 +12,18 @@
 #define R32_NFC_DRV                   (*(vu32*)0x4000E014)
 
 #define RB_TMR_FREQ_13_56             0x20
+#define TMR0_NFCA_PICC_ETU            128 // For NFC at 106 kbps, 1 ETU  is ~128 / 13.56 MHz = ~9.44 us.
+#define TMR0_NFCA_PICC_ETU_TOL        16
 #define TMR0_NFCA_PICC_CNT_END        288
-#define TMR0_NFCA_PICC_FTD            1280 // 10 et_u, wait for sending response
+#define TMR0_NFCA_PICC_FTD            1236 // Frame Delay Time (~91.15us), wait for sending response
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
 #define TMR3_CTRL_PWM_ON              ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
 #define TMR3_CTRL_PWM_OFF             0
 
 #define NFCA_DATA_BUF_SIZE                       512
-#define NFCA_PICC_SIGNAL_BUF_SIZE                512
+#define NFCA_PICC_SIGNAL_BUF_SIZE                64
 #define NFCA_PICC_TX_BUF_SIZE                    512
+#define NFCA_PICC_RESP_SIZE                      128
 #define NFCA_PCD_MAX_SEND_NUM                    (NFCA_DATA_BUF_SIZE)
 #define NFCA_PCD_MAX_RECV_NUM                    (NFCA_DATA_BUF_SIZE * 16 / 9)
 #define NFCA_MAX_PARITY_NUM                      (NFCA_PCD_MAX_RECV_NUM)
@@ -54,8 +57,8 @@ __attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM 
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE];
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_tx_buf[NFCA_PICC_TX_BUF_SIZE];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
-uint8_t picc_uid[7];
-uint8_t ATQA[] = {0x44, 0x00};
+__attribute__((aligned(4))) static uint8_t picc_uid[7];
+__attribute__((aligned(4))) static uint8_t RESP[NFCA_PICC_RESP_SIZE];
 
 static uint16_t gs_lpcd_adc_base_value;
 uint16_t g_nfca_pcd_recv_buf_len;
@@ -67,8 +70,8 @@ uint8_t g_nfca_pcd_buf_offset;
 uint8_t g_nfca_pcd_intf_mode;
 uint8_t g_nfca_pcd_comm_status;
 
-static volatile uint32_t gs_picc_last_processed_dma_idx = 0;
-static volatile uint32_t gs_picc_data_idx = 0;
+static int gs_picc_last_processed_dma_idx; // to .sbss, which is initialized to 0
+static int gs_picc_data_idx; // to .sbss, which is initialized to 0
 
 typedef enum {
 	NFCA_PCD_CONTROLLER_STATE_FREE = 0,
@@ -79,6 +82,13 @@ typedef enum {
 	NFCA_PCD_CONTROLLER_STATE_DONE,
 	NFCA_PCD_CONTROLLER_STATE_ERR,
 } nfca_pcd_controller_state_t;
+
+typedef enum {
+	PICC_STATE_FREE = 0,
+	PICC_STATE_PREPARE_RESP,
+	PICC_STATE_SEND_RESP,
+} nfca_picc_controller_state_t;
+static nfca_picc_controller_state_t gs_picc_state; // to .sbss, which is initialized to 0
 
 typedef enum {
 	NFCA_PCD_DRV_CTRL_LEVEL0 = (0x00 << 13),
@@ -301,8 +311,8 @@ void TMR3_IRQHandler(void) {
 		R8_TMR3_INTER_EN = 0;
 	}
 
+	gs_picc_state = PICC_STATE_FREE;
 	NVIC_ClearPendingIRQ(TMR3_IRQn);
-	NVIC_EnableIRQ(TMR0_IRQn); // enable rx again
 }
 
 uint16_t sys_get_vdd(void) {
@@ -702,8 +712,8 @@ void nfca_picc_start() {
 	R32_TMR0_DMA_END = (uint32_t)&(gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE]);
 	R8_TMR0_CTRL_DMA = RB_TMR_DMA_LOOP | RB_TMR_DMA_ENABLE;
 
-	R8_TMR0_INT_FLAG = RB_TMR_IF_DATA_ACT; // clear new data flag
-	R8_TMR0_INTER_EN = RB_TMR_IE_DATA_ACT;
+	R8_TMR0_INT_FLAG = (RB_TMR_IF_DATA_ACT | RB_TMR_IF_CYC_END); // clear interrupt flags
+	R8_TMR0_INTER_EN = (RB_TMR_IE_DATA_ACT | RB_TMR_IE_CYC_END);
 
 	R8_TMR0_CTRL_MOD = (RB_TMR_MODE_IN | (RiseEdge_To_RiseEdge << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
 
@@ -1001,10 +1011,6 @@ void nfca_pcd_test() {
 	}
 }
 
-// For NFC at 106 kbps, 1 ETU is ~128 / 13.56 MHz = ~9.44 us.
-#define ETU           128
-#define ETU_TOLERANCE 16
-
 static inline int is_close(uint16_t val, uint16_t target, uint16_t tol) {
 	uint16_t diff = (val > target) ? (val - target) : (target - val);
 	return diff < tol;
@@ -1062,10 +1068,10 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 		uint16_t pulse = pulses[i];
 
 		if (last_bit == '0') {
-			if (is_close(pulse, ETU, ETU_TOLERANCE)) {
+			if (is_close(pulse, TMR0_NFCA_PICC_ETU , TMR0_NFCA_PICC_ETU_TOL)) {
 				result_buf[bit_idx++] = '0';
 			}
-			else if (is_close(pulse, (ETU * 3 / 2), ETU_TOLERANCE)) { // 1.5 * ETU
+			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 3 / 2), TMR0_NFCA_PICC_ETU_TOL)) { // 1.5 * ETU
 				result_buf[bit_idx++] = '1';
 			}
 			else {
@@ -1073,14 +1079,14 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 			}
 		}
 		else { // last_bit == '1'
-			if (is_close(pulse, ETU, ETU_TOLERANCE)) {
+			if (is_close(pulse, TMR0_NFCA_PICC_ETU , TMR0_NFCA_PICC_ETU_TOL)) {
 				result_buf[bit_idx++] = '1';
 			}
-			else if (is_close(pulse, (ETU * 3 / 2), ETU_TOLERANCE)) { // 1.5 * ETU
+			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 3 / 2), TMR0_NFCA_PICC_ETU_TOL)) { // 1.5 * ETU
 				result_buf[bit_idx++] = '0';
 				result_buf[bit_idx++] = '0';
 			}
-			else if (is_close(pulse, (ETU * 2), ETU_TOLERANCE)) { // 2.0 * ETU
+			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 2), TMR0_NFCA_PICC_ETU_TOL)) { // 2.0 * ETU
 				result_buf[bit_idx++] = '0';
 				result_buf[bit_idx++] = '1';
 			}
@@ -1159,58 +1165,49 @@ __HIGH_CODE
 void TMR0_IRQHandler(void) {
 	uint8_t status = R8_TMR0_INT_FLAG;
 	R8_TMR0_INT_FLAG = status;	// Acknowledge
+	uint32_t current_counter = R32_TMR0_COUNT;
 
 	if(status & RB_TMR_IF_DATA_ACT) {
 		// Get the index of the NEXT free spot in the DMA buffer.
-		uint32_t current_dma_idx = (R32_TMR0_DMA_NOW - R32_TMR0_DMA_BEG) / sizeof(uint32_t);
+		int current_dma_idx = (R32_TMR0_DMA_NOW - R32_TMR0_DMA_BEG) / sizeof(uint32_t);
+		while(gs_picc_last_processed_dma_idx != current_dma_idx) {
+			uint16_t value_from_dma = (uint16_t)gs_nfca_picc_signal_buf[gs_picc_last_processed_dma_idx];
 
-		while (gs_picc_last_processed_dma_idx != current_dma_idx) {
-			if (gs_picc_data_idx < NFCA_DATA_BUF_SIZE) {
-				uint32_t value_from_dma = gs_nfca_picc_signal_buf[gs_picc_last_processed_dma_idx];
-				// rise to rise timings are never below one et_u (128 ticks in our case) or more than 2 et_u (101)
-				if(96 < value_from_dma && value_from_dma < 288) {
-					gs_nfca_data_buf[gs_picc_data_idx++] = (uint16_t)value_from_dma;
-				}
-				else if(gs_nfca_data_buf[gs_picc_data_idx -1] != 0xFFFF) {
-					// don't write pulse trains less than 5 bits (WUPA), overwrite that last one on next trigger
-					if(gs_nfca_data_buf[gs_picc_data_idx -2] == 0xFFFF) {
-						gs_picc_data_idx -= 1;
-					}
-					else if(gs_nfca_data_buf[gs_picc_data_idx -3] == 0xFFFF) {
-						gs_picc_data_idx -= 2;
-					}
-					else if(gs_nfca_data_buf[gs_picc_data_idx -4] == 0xFFFF) {
-						gs_picc_data_idx -= 3;
-					}
-					else if(gs_nfca_data_buf[gs_picc_data_idx -5] == 0xFFFF) {
-						gs_picc_data_idx -= 4;
-					}
-					else {
-						gs_nfca_data_buf[gs_picc_data_idx++] = 0xFFFF;
-					}
-				}
+			// rise to rise timings are never below one et_u (128 ticks in our case) or more than 2 et_u (101)
+			if(120 < value_from_dma && value_from_dma < 264) {
+				gs_nfca_data_buf[gs_picc_data_idx++] = value_from_dma;
+			}
+			else {
+				// noise, restart pulse train capture
+				gs_picc_data_idx = 0;
 			}
 
 			// Advance our tracking index, wrapping around the circular DMA buffer.
 			gs_picc_last_processed_dma_idx = (gs_picc_last_processed_dma_idx + 1) % NFCA_PICC_SIGNAL_BUF_SIZE;
 		}
 
-		// advance timer for sending response
-		R32_TMR0_CNT_END = R32_TMR0_COUNT +TMR0_NFCA_PICC_FTD; // 10 et_u
-		R8_TMR0_INTER_EN |= RB_TMR_IE_CYC_END;
+		if(gs_picc_data_idx > 4) {
+			// advance timer for preparing response
+			gs_picc_state = PICC_STATE_PREPARE_RESP;
+			R32_TMR0_CNT_END = current_counter +(TMR0_NFCA_PICC_FTD /4);
+		}
 	}
 
 	if(status & RB_TMR_IF_CYC_END) {
-		R8_TMR0_INTER_EN &= ~RB_TMR_IE_CYC_END; // disable response timer
-		NVIC_DisableIRQ(TMR0_IRQn);
-		if(gs_picc_data_idx > 4) {
-			wch_nfca_picc_prepare_tx_dma(ATQA, sizeof(ATQA));
+		if(gs_picc_state == PICC_STATE_PREPARE_RESP) {
+			RESP[0] = 0x44;
+			RESP[1] = 0x00;
+			wch_nfca_picc_prepare_tx_dma(RESP, 2);
+
+			gs_picc_state = PICC_STATE_SEND_RESP;
+			R32_TMR0_CNT_END = current_counter +(TMR0_NFCA_PICC_FTD /2); // should be 3/4 actually, but this times better for some reason
+		}
+		else if(gs_picc_state == PICC_STATE_SEND_RESP) {
 			// Start the timer, which starts the whole DMA-driven transmission process
 			R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
 			R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (High_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
-		}
-		else {
-			NVIC_EnableIRQ(TMR0_IRQn);
+
+			gs_picc_state = PICC_STATE_FREE;
 		}
 		gs_picc_data_idx = 0;
 	}
