@@ -19,7 +19,7 @@
 #define TMR0_NFCA_PICC_IS_1ETU(p)     PLUSMIN_7(p, TMR0_NFCA_PICC_ETU)
 #define TMR0_NFCA_PICC_IS_1_5ETU(p)   PLUSMIN_7(p, ((TMR0_NFCA_PICC_ETU /2) *3))
 #define TMR0_NFCA_PICC_IS_2ETU(p)     PLUSMIN_7(p, (TMR0_NFCA_PICC_ETU *2))
-#define TMR3_NFCA_PICC_FTD            ((1236 /72) -5) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4), -5 for PCD pulse wait), wait time for sending response (tweak this!)
+#define TMR3_NFCA_PICC_FTD            (1236 /72) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4)), wait time for sending response (tweak this!)
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
 #define TMR3_CTRL_PWM_ON              ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
 #define TMR3_CTRL_PWM_OFF             0
@@ -1036,10 +1036,10 @@ static inline uint8_t bits_to_frame(uint8_t bit_str[], int len) {
 	// this is reusing (overwriting!) the input bit string!
 	uint8_t num_bytes = 0;
 	if(bit_str[0] != '0' || bit_str[len -1] != '0') {
-		printf("* ERROR in bits_to_frame: SOF/EOF not zero\n");
+		// printf("* ERROR in bits_to_frame: SOF/EOF not zero\n");
 	}
 	else if((len -2) % 9) { // frame len is 9 bits per byte, + SOF,EOF
-		printf("* ERROR in bits_to_frame: bit string is incomplete\n");
+		// printf("* ERROR in bits_to_frame: bit string is incomplete\n");
 	}
 	else {
 		for(int i = 1; i < (len -1); i += 9) {
@@ -1047,7 +1047,9 @@ static inline uint8_t bits_to_frame(uint8_t bit_str[], int len) {
 				bit_str[num_bytes++] = bits_to_byte(&bit_str[i]);
 			}
 			else {
-				printf("* ERROR in bits_to_frame: wrong parity of byte at index %d\n", i);
+				num_bytes = 0;
+				break;
+				// printf("* ERROR in bits_to_frame: wrong parity of byte at index %d\n", i);
 			}
 		}
 	}
@@ -1181,7 +1183,7 @@ void TMR0_IRQHandler(void) {
 
 	if(gs_picc_data_idx > 4) {
 		uint16_t pulse_sum = 0;
-		for(int i = 0; i < 5; i++) {
+		for(int i = 0; i < 5 && !gs_picc_anticoll_cmd_guess; i++) {
 			// WUPA 0x26, sum([128, 192, 192, 192, 256]) = 960
 			// REQA 0x52, sum([128, 192, 128, 192, 192, ...]) = 832
 			// HALT 0x50, sum([128, 128, 128, 128, 192, ...]) = 704
@@ -1226,25 +1228,59 @@ void TMR0_IRQHandler(void) {
 		}
 
 		// set TMR3 timer for preparing response
-		if(gs_picc_anticoll_cmd_guess && (gs_picc_state != PICC_STATE_SEND_RESP)) {
-			gs_picc_state = PICC_STATE_WAIT_FOR_SEND_RESP;
+		if(gs_picc_state != PICC_STATE_SEND_RESP) {
+			int req_len = decode_pulses_to_bits(gs_nfca_data_buf, /*len=*/gs_picc_data_idx, gs_picc_req_resp);
+			uint8_t cmd = 0;
+			uint8_t frame_len = 0;
 
-			R8_TMR3_CTRL_MOD = RB_TMR_ALL_CLEAR;
-			R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
-			gs_nfca_picc_tx_buf[0] = TMR3_CTRL_PWM_OFF;
-			gs_nfca_picc_tx_buf[1] = TMR3_CTRL_PWM_OFF; // _ON to check if it waits long enough for a PCD pulse
-			gs_nfca_picc_tx_buf[2] = TMR3_CTRL_PWM_OFF;
-			gs_nfca_picc_tx_buf[3] = TMR3_CTRL_PWM_OFF; // _ON to check if it waits long enough for a PCD pulse
-			gs_nfca_picc_tx_buf[4] = TMR3_CTRL_PWM_OFF;
-			R32_TMR3_DMA_BEG = (uint32_t)gs_nfca_picc_tx_buf;
-			R32_TMR3_DMA_END = (uint32_t)&gs_nfca_picc_tx_buf[5];
+			if(req_len > 0) {
+				switch(gs_picc_anticoll_cmd_guess) {
+				case PICC_REQA:
+				case PICC_WUPA:
+					cmd = bits_to_byte(gs_picc_req_resp) >> 1; // >> 1 to discard EOF 0 last bit
+					if(cmd == gs_picc_anticoll_cmd_guess) {
+						gs_picc_state = PICC_STATE_SEND_RESP;
 
-			R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
-			R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-
-			// Start the timer by enabling the DMA-driven PWM output
-			R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
-			R8_TMR3_CTRL_MOD = (RB_TMR_OUT_EN | (High_Level << 4) | (PWM_Times_4 << 6) | RB_TMR_FREQ_13_56 | RB_TMR_COUNT_EN);
+						R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
+						gs_picc_req_resp[0] = 0x44;
+						gs_picc_req_resp[1] = 0x00;
+						wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD, gs_picc_req_resp, 2);
+				
+						R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
+						R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
+				
+						// Start the timer, which starts the whole DMA-driven transmission process
+						R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
+					}
+					else {
+						gs_picc_anticoll_cmd_guess = 0;
+						gs_picc_state = PICC_STATE_FREE;
+						printf("guess was wrong: 0x%02x != 0x%02x", cmd, gs_picc_anticoll_cmd_guess);
+					}
+					break;
+				case PICC_HALT:
+				case PICC_ANTICOLL1:
+				case PICC_ANTICOLL2:
+				case PICC_ANTICOLL3:
+					frame_len = bits_to_frame(gs_picc_req_resp, req_len); // gs_picc_req_resp is reused as output
+					if(frame_len) {
+						if(gs_picc_req_resp[0] == gs_picc_anticoll_cmd_guess) {
+							printf("frame (%d): %02x %02x ...\n", frame_len, gs_picc_req_resp[0], gs_picc_req_resp[1]);
+						}
+						else {
+							gs_picc_anticoll_cmd_guess = 0;
+							gs_picc_state = PICC_STATE_FREE;
+							printf("guess was wrong: 0x%02x != 0x%02x", gs_picc_req_resp[0], gs_picc_anticoll_cmd_guess);
+						}
+					}
+					break;
+				default:
+					break;
+				}
+			}
+			else {
+				gs_picc_anticoll_cmd_guess = 0;
+			}
 		}
 	}
 
@@ -1256,46 +1292,9 @@ __HIGH_CODE
 void TMR3_IRQHandler(void) {
 	R8_TMR3_INT_FLAG = R8_TMR3_INT_FLAG; // Acknowledge
 
-	switch(gs_picc_state) {
-	case PICC_STATE_WAIT_FOR_SEND_RESP:
-		switch(gs_picc_anticoll_cmd_guess) {
-		case PICC_REQA:
-		case PICC_WUPA:
-			gs_picc_state = PICC_STATE_SEND_RESP;
-
-			R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
-			gs_picc_req_resp[0] = 0x44;
-			gs_picc_req_resp[1] = 0x00;
-			wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD, gs_picc_req_resp, 2);
-	
-			R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
-			R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-	
-			// Start the timer, which starts the whole DMA-driven transmission process
-			R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
-			break;
-		case PICC_HALT:
-			// no response
-			gs_picc_state = PICC_STATE_FREE;
-			R8_TMR3_CTRL_DMA = 0;
-			R8_TMR3_INTER_EN = 0;
-			break;
-		case PICC_ANTICOLL1:
-		case PICC_ANTICOLL2:
-		case PICC_ANTICOLL3:
-			gs_picc_state = PICC_STATE_FREE;
-			R8_TMR3_CTRL_DMA = 0;
-			R8_TMR3_INTER_EN = 0;
-			break;
-		}
-		break;
-	case PICC_STATE_SEND_RESP: // Fall-through to _FREE, because we finished sending the response
-	case PICC_STATE_FREE:
-		gs_picc_state = PICC_STATE_FREE;
-		R8_TMR3_CTRL_DMA = 0;
-		R8_TMR3_INTER_EN = 0;
-		break;
-	}
+	gs_picc_state = PICC_STATE_FREE;
+	R8_TMR3_CTRL_DMA = 0;
+	R8_TMR3_INTER_EN = 0;
 
 	NVIC_ClearPendingIRQ(TMR3_IRQn);
 }
