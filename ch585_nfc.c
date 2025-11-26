@@ -14,7 +14,7 @@
 #define RB_TMR_FREQ_13_56             0x20
 #define TMR0_NFCA_PICC_ETU            128 // For NFC at 106 kbps, 1 ETU  is ~128 / 13.56 MHz = ~9.44 us.
 #define TMR0_NFCA_PICC_ETU_TOL        8
-#define TMR3_NFCA_PICC_FTD            ((1236 /77) -5) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4), -5 for PCD pulse wait), wait time for sending response (tweak this!)
+#define TMR3_NFCA_PICC_FTD            ((1236 /72) -5) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4), -5 for PCD pulse wait), wait time for sending response (tweak this!)
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
 #define TMR3_CTRL_PWM_ON              ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
 #define TMR3_CTRL_PWM_OFF             0
@@ -1200,13 +1200,6 @@ void TMR0_IRQHandler(void) {
 				if((pulse_sum >> 3) == (832 >> 3)) { // REQA
 					gs_picc_anticoll_cmd_guess = PICC_REQA;
 				}
-				else if(((pulse_sum -gs_nfca_data_buf[0] +gs_nfca_data_buf[gs_picc_data_idx]) >> 3) == (960 >> 3)) { // first pulse is noise, WUPA
-					for(int i = 0; i < gs_picc_data_idx -1; i++) {
-						gs_nfca_data_buf[i] = gs_nfca_data_buf[i +1];
-					}
-					gs_picc_data_idx--;
-					gs_picc_anticoll_cmd_guess = PICC_WUPA;
-				}
 				break;
 			case 7: // HALT 0x50, SEL1 0x93, SEL1 0x95, SEL1 0x97
 				if((pulse_sum >> 3) == (704 >> 3)) { // HALT
@@ -1225,13 +1218,6 @@ void TMR0_IRQHandler(void) {
 						gs_picc_anticoll_cmd_guess = PICC_ANTICOLL3;
 						break;
 					}
-				}
-				else if(((pulse_sum -gs_nfca_data_buf[0] +gs_nfca_data_buf[gs_picc_data_idx]) >> 3) == (832 >> 3)) { // first pulse is noise, REQA
-					for(int i = 0; i < gs_picc_data_idx -1; i++) {
-						gs_nfca_data_buf[i] = gs_nfca_data_buf[i +1];
-					}
-					gs_picc_data_idx--;
-					gs_picc_anticoll_cmd_guess = PICC_REQA;
 				}
 				break;
 			}
@@ -1301,17 +1287,13 @@ void TMR3_IRQHandler(void) {
 			break;
 		}
 		break;
-	case PICC_STATE_SEND_RESP: // Fall-through
+	case PICC_STATE_SEND_RESP: // Fall-through to _FREE, because we finished sending the response
 	case PICC_STATE_FREE:
 		gs_picc_state = PICC_STATE_FREE;
 		R8_TMR3_CTRL_DMA = 0;
 		R8_TMR3_INTER_EN = 0;
-
-		gs_picc_data_idx = 0;
-		gs_picc_anticoll_cmd_guess = 0;
 		break;
 	}
-
 
 	NVIC_ClearPendingIRQ(TMR3_IRQn);
 }
