@@ -11,9 +11,14 @@
 #define R16_NFC_TMR                   (*(vu16*)0x4000E010)
 #define R32_NFC_DRV                   (*(vu32*)0x4000E014)
 
+#define PLUSMIN_7(t,r)                     ((t >> 3) == (r >> 3))
+#define PLUSMIN_15(t,r)                    ((t >> 4) == (r >> 4))
+
 #define RB_TMR_FREQ_13_56             0x20
 #define TMR0_NFCA_PICC_ETU            128 // For NFC at 106 kbps, 1 ETU  is ~128 / 13.56 MHz = ~9.44 us.
-#define TMR0_NFCA_PICC_ETU_TOL        8
+#define TMR0_NFCA_PICC_IS_1ETU(p)     PLUSMIN_7(p, TMR0_NFCA_PICC_ETU)
+#define TMR0_NFCA_PICC_IS_1_5ETU(p)   PLUSMIN_7(p, ((TMR0_NFCA_PICC_ETU /2) *3))
+#define TMR0_NFCA_PICC_IS_2ETU(p)     PLUSMIN_7(p, (TMR0_NFCA_PICC_ETU *2))
 #define TMR3_NFCA_PICC_FTD            ((1236 /72) -5) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4), -5 for PCD pulse wait), wait time for sending response (tweak this!)
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
 #define TMR3_CTRL_PWM_ON              ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
@@ -1007,11 +1012,6 @@ void nfca_pcd_test() {
 	}
 }
 
-static inline int is_close(uint16_t val, uint16_t target, uint16_t tol) {
-	uint16_t diff = (val > target) ? (val - target) : (target - val);
-	return diff < tol;
-}
-
 static inline uint8_t check_parity(uint8_t bit_str[]) {
 	char expected = '1';
 	for(int i = 0; i < 8; i++) {
@@ -1056,8 +1056,8 @@ static inline uint8_t bits_to_frame(uint8_t bit_str[], int len) {
 }
 
 __HIGH_CODE
-int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
-	int8_t bit_idx = 0;
+int decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
+	int bit_idx = 0;
 	result_buf[bit_idx++] = '0'; // Initial state starts with a '0' bit
 
 	for (int i = 0; i < len; ++i) {
@@ -1065,10 +1065,10 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 		uint16_t pulse = pulses[i];
 
 		if (last_bit == '0') {
-			if (is_close(pulse, TMR0_NFCA_PICC_ETU , TMR0_NFCA_PICC_ETU_TOL)) {
+			if (TMR0_NFCA_PICC_IS_1ETU(pulse)) {
 				result_buf[bit_idx++] = '0';
 			}
-			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 3 / 2), TMR0_NFCA_PICC_ETU_TOL)) { // 1.5 * ETU
+			else if (TMR0_NFCA_PICC_IS_1_5ETU(pulse)) {
 				result_buf[bit_idx++] = '1';
 			}
 			else {
@@ -1076,14 +1076,14 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 			}
 		}
 		else { // last_bit == '1'
-			if (is_close(pulse, TMR0_NFCA_PICC_ETU , TMR0_NFCA_PICC_ETU_TOL)) {
+			if (TMR0_NFCA_PICC_IS_1ETU(pulse)) {
 				result_buf[bit_idx++] = '1';
 			}
-			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 3 / 2), TMR0_NFCA_PICC_ETU_TOL)) { // 1.5 * ETU
+			else if (TMR0_NFCA_PICC_IS_1_5ETU(pulse)) {
 				result_buf[bit_idx++] = '0';
 				result_buf[bit_idx++] = '0';
 			}
-			else if (is_close(pulse, (TMR0_NFCA_PICC_ETU  * 2), TMR0_NFCA_PICC_ETU_TOL)) { // 2.0 * ETU
+			else if (TMR0_NFCA_PICC_IS_2ETU(pulse)) {
 				result_buf[bit_idx++] = '0';
 				result_buf[bit_idx++] = '1';
 			}
@@ -1097,15 +1097,16 @@ int8_t decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 }
 
 __HIGH_CODE
-static uint16_t nfca_manchester_encode(int preamble, const uint8_t *data, uint8_t num_bytes) {
+static uint16_t nfca_manchester_encode(int frame_delay_time, const uint8_t *data, uint8_t num_bytes) {
 	uint16_t dma_idx = 0;
 	uint8_t parity;
 
-	for(int i = 0; i < preamble; i++) {
+	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
+	for(int i = 0; i < frame_delay_time -1; i++) {
 		gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 	}
 
-	// Start of Frame (SOF) - a '0' pattern (with an extra OFF in front to please TMR3)
+	// Start of Frame (SOF)
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 	gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 
@@ -1117,11 +1118,11 @@ static uint16_t nfca_manchester_encode(int preamble, const uint8_t *data, uint8_
 		for (uint8_t j = 0; j < 8; j++) {
 			uint8_t bit = (current_byte >> j) & 1;
 			parity ^= bit;
-			if (bit) { // '1' bit (Low then High subcarrier)
+			if (bit) { // '1' bit (High then Low subcarrier)
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 			}
-			else { // '0' bit (High then Low subcarrier)
+			else { // '0' bit (Low then High subcarrier)
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_OFF;
 				gs_nfca_picc_tx_buf[dma_idx++] = TMR3_CTRL_PWM_ON;
 			}
@@ -1163,7 +1164,9 @@ void TMR0_IRQHandler(void) {
 		uint16_t value_from_dma = (uint16_t)gs_nfca_picc_signal_buf[gs_picc_last_processed_dma_idx];
 
 		// rise to rise timings are never below one et_u (128 ticks in our case) or more than 2 et_u (101)
-		if((TMR0_NFCA_PICC_ETU -TMR0_NFCA_PICC_ETU_TOL) < value_from_dma && value_from_dma < ((2*TMR0_NFCA_PICC_ETU) +TMR0_NFCA_PICC_ETU_TOL)) {
+		if(TMR0_NFCA_PICC_IS_1ETU(value_from_dma) ||
+			TMR0_NFCA_PICC_IS_1_5ETU(value_from_dma) ||
+			TMR0_NFCA_PICC_IS_2ETU(value_from_dma)) {
 			gs_nfca_data_buf[gs_picc_data_idx++] = value_from_dma;
 		}
 		else {
@@ -1188,26 +1191,25 @@ void TMR0_IRQHandler(void) {
 			pulse_sum += gs_nfca_data_buf[i];
 		}
 
-		// >> 3 = +/-7
 		if(!gs_picc_anticoll_cmd_guess) {
 			switch(gs_picc_data_idx) {
 			case 5: // WUPA 0x26, [128, 192, 192, 192, 256]
-				if((pulse_sum >> 3) == (960 >> 3)) { // WUPA
+				if(PLUSMIN_7(pulse_sum, 960)) { // WUPA
 					gs_picc_anticoll_cmd_guess = PICC_WUPA;
 				}
 				break;
 			case 6: // REQA 0x52, [128, 192, 128, 192, 192, 192]
-				if((pulse_sum >> 3) == (832 >> 3)) { // REQA
+				if(PLUSMIN_7(pulse_sum, 832)) { // REQA
 					gs_picc_anticoll_cmd_guess = PICC_REQA;
 				}
 				break;
 			case 7: // HALT 0x50, SEL1 0x93, SEL1 0x95, SEL1 0x97
-				if((pulse_sum >> 3) == (704 >> 3)) { // HALT
+				if(PLUSMIN_7(pulse_sum, 704)) { // HALT
 					gs_picc_anticoll_cmd_guess = PICC_HALT;
 				}
-				else if((pulse_sum >> 3) == (896 >> 3) || // SEL1,3
-						(pulse_sum >> 3) == (1088 >> 3)) { // SEL2
-					switch(gs_nfca_data_buf[2] >> 3) {
+				else if(PLUSMIN_7(pulse_sum, 896) || // SEL1,3
+						PLUSMIN_7(pulse_sum, 1088)) { // SEL2
+					switch(gs_nfca_data_buf[2] >> 3) { // >> 3 = +/-7
 					case 192 >> 3:
 						gs_picc_anticoll_cmd_guess = PICC_ANTICOLL1;
 						break;
