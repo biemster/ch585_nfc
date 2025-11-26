@@ -145,4 +145,7 @@ def plot_nfc_command(command_name, command_bytes, et_u=128):
 # --- EXAMPLES ---
 plot_nfc_command("REQA", [0x26])
 plot_nfc_command("WUPA", [0x52])
+plot_nfc_command("HALT", [0x50, 0x00, 0x57, 0xcd])
 plot_nfc_command("Anticollision CL1", [0x93, 0x20])
+plot_nfc_command("Anticollision CL2", [0x95, 0x20])
+plot_nfc_command("Anticollision CL3", [0x97, 0x20])
