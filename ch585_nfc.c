@@ -19,8 +19,8 @@
 #define TMR0_NFCA_PICC_IS_1ETU(p)     PLUSMIN_7(p, TMR0_NFCA_PICC_ETU)
 #define TMR0_NFCA_PICC_IS_1_5ETU(p)   PLUSMIN_7(p, ((TMR0_NFCA_PICC_ETU /2) *3))
 #define TMR0_NFCA_PICC_IS_2ETU(p)     PLUSMIN_7(p, (TMR0_NFCA_PICC_ETU *2))
-#define TMR3_NFCA_PICC_FTD            (1236 /72) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4)), wait time for sending response (tweak this!)
 #define TMR3_NFCA_PICC_CNT_END        18 // picc -> pcd freq is 13.56 / 16, but 18 - 20 correspond better to the ch585 nfc freq (18 is used in the blob)
+#define TMR3_NFCA_PICC_FTD            (1236 / (TMR3_NFCA_PICC_CNT_END *4)) // Frame Delay Time (~91.15us, divided by PWM period (=CNT_END*4)), wait time for sending response
 #define TMR3_CTRL_PWM_ON              ((TMR3_NFCA_PICC_CNT_END /2) -1) // blob uses 8 with CNT_END 18
 #define TMR3_CTRL_PWM_OFF             0
 
@@ -42,6 +42,7 @@
 #define PICC_ANTICOLL2         0x95
 #define PICC_ANTICOLL3         0x97
 #define PICC_HALT              0x50
+#define PICC_READ              0x30
 
 #define NAK_INVALID_ARG        0x00
 #define NAK_CRC_ERROR          0x01
@@ -57,28 +58,31 @@
 #define NFCA_PCD_SET_OUT_DRV(lvl) (R32_NFC_DRV = ((R32_NFC_DRV & 0x9ff) | lvl))
 
 __attribute__((aligned(4))) static uint16_t gs_nfca_data_buf[NFCA_DATA_BUF_SIZE];
-__attribute__((aligned(4))) uint8_t g_nfca_parity_buf[NFCA_MAX_PARITY_NUM];
-__attribute__((aligned(4))) uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
-__attribute__((aligned(4))) uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM + 3) & 0xfffc)];
+__attribute__((aligned(4))) static uint8_t g_nfca_parity_buf[NFCA_MAX_PARITY_NUM];
+__attribute__((aligned(4))) static uint8_t g_nfca_pcd_send_buf[((NFCA_PCD_MAX_SEND_NUM + 3) & 0xfffc)];
+__attribute__((aligned(4))) static uint8_t g_nfca_pcd_recv_buf[((NFCA_PCD_MAX_RECV_NUM + 3) & 0xfffc)];
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_signal_buf[NFCA_PICC_SIGNAL_BUF_SIZE];
 __attribute__((aligned(4))) static uint32_t gs_nfca_picc_tx_buf[NFCA_PICC_TX_BUF_SIZE];
 __attribute__((aligned(4))) static uint16_t gs_lpcd_adc_filter_buf[8];
-__attribute__((aligned(4))) static uint8_t picc_uid[7];
+__attribute__((aligned(4))) static uint8_t ATQA[2];
+__attribute__((aligned(4))) static uint8_t picc_uid[10];
+__attribute__((aligned(4))) static uint8_t picc_ultralight_pages[6 *4]; // 6 pages of 4 bytes
 __attribute__((aligned(4))) static uint8_t gs_picc_req_resp[NFCA_PICC_RESP_SIZE];
 
 static uint16_t gs_lpcd_adc_base_value;
-uint16_t g_nfca_pcd_recv_buf_len;
-uint32_t g_nfca_pcd_recv_bits;
-uint16_t g_nfca_pcd_recv_word_idx;
-uint16_t g_nfca_pcd_send_fifo_bytes;
-uint16_t g_nfca_pcd_send_total_bytes;
-uint8_t g_nfca_pcd_buf_offset;
-uint8_t g_nfca_pcd_intf_mode;
-uint8_t g_nfca_pcd_comm_status;
+static uint16_t g_nfca_pcd_recv_buf_len;
+static uint32_t g_nfca_pcd_recv_bits;
+static uint16_t g_nfca_pcd_recv_word_idx;
+static uint16_t g_nfca_pcd_send_fifo_bytes;
+static uint16_t g_nfca_pcd_send_total_bytes;
+static uint8_t g_nfca_pcd_buf_offset;
+static uint8_t g_nfca_pcd_intf_mode;
+static uint8_t g_nfca_pcd_comm_status;
 
 static int gs_picc_last_processed_dma_idx; // to .sbss, which is initialized to 0
 static int gs_picc_data_idx; // to .sbss, which is initialized to 0
 static int gs_picc_anticoll_cmd_guess; // to .sbss, which is initialized to 0
+static int gs_picc_uid_len; // to .sbss, which is initialized to 0
 
 typedef enum {
 	NFCA_PCD_CONTROLLER_STATE_FREE = 0,
@@ -1099,7 +1103,7 @@ int decode_pulses_to_bits(uint16_t pulses[], int len, uint8_t *result_buf) {
 }
 
 __HIGH_CODE
-static uint16_t nfca_manchester_encode(int frame_delay_time, const uint8_t *data, uint8_t num_bytes) {
+uint16_t nfca_manchester_encode(int frame_delay_time, const uint8_t *data, uint8_t num_bytes) {
 	uint16_t dma_idx = 0;
 	uint8_t parity;
 
@@ -1155,6 +1159,172 @@ void wch_nfca_picc_prepare_tx_dma(int silence, uint8_t *data, uint8_t num_bytes)
 	R32_TMR3_DMA_END = (uint32_t)&gs_nfca_picc_tx_buf[dma_len +1];
 }
 
+__HIGH_CODE
+int wch_nfca_standard_frame_response(uint8_t *data, uint8_t num_bytes, int req_resp_debug) {
+	// Create response for PCD request
+	int res = 0;
+	int page_start = 0;
+
+	if(req_resp_debug) {
+		printf("req (%d): [0x%02x", num_bytes, data[0]);
+		for(int i = 1; i < num_bytes; i++) {
+			printf(" 0x%02x", data[i]);
+		}
+		printf("]\n");
+	}
+
+	switch(data[0]) {
+	case PICC_READ:
+		page_start = data[1] *4;
+		for(int i = 0; i < 16; i++) {
+			data[i] = picc_ultralight_pages[i +page_start];
+			ISO14443AAppendCRCA(data, 16);
+		}
+		break;
+	default:
+		res = 0; // no response
+		break;
+	}
+
+	if(req_resp_debug) {
+		printf("resp (%d): [0x%02x", res, data[0]);
+		for(int i = 1; i < res; i++) {
+			printf(" 0x%02x", data[i]);
+		}
+		printf("]\n");
+	}
+
+	return res;
+}
+
+__HIGH_CODE
+int wch_nfca_anticoll_response(uint8_t *data, uint8_t num_bytes, int req_resp_debug) {
+	// Create response for PCD request
+	int i = 0;
+	int res = 0;
+
+	if(req_resp_debug) {
+		printf("req (%d): [0x%02x", num_bytes, data[0]);
+		for(int i = 1; i < num_bytes; i++) {
+			printf(" 0x%02x", data[i]);
+		}
+		printf("]\n");
+	}
+
+	switch(data[0]) {
+	case PICC_ANTICOLL1:
+		switch(data[1]) {
+		case 0x20: // requested 4 bytes
+			if(gs_picc_uid_len > 4) {
+				data[i++] = 0x88;
+			}
+			else {
+				data[3] = picc_uid[3];
+			}
+			data[i++] = picc_uid[0];
+			data[i++] = picc_uid[1];
+			data[i++] = picc_uid[2];
+
+			data[4] = data[0] ^ data[1] ^ data[2] ^ data[3]; // Block Check Character
+			res = 5;
+			break;
+		case 0x70: // full frame
+			if((gs_picc_uid_len > 4) && (data[3] == picc_uid[0]) && (data[4] == picc_uid[1]) && (data[5] == picc_uid[2])) {
+				// acknowledge
+				data[0] = 0x04;
+				ISO14443AAppendCRCA(data, 1);
+				res = 3;
+			}
+			else if((data[2] == picc_uid[0]) && (data[3] == picc_uid[1]) && (data[4] == picc_uid[2]) && (data[5] == picc_uid[3])) {
+				// acknowledge
+				data[0] = 0x00;
+				ISO14443AAppendCRCA(data, 1);
+				res = 3;
+			}
+			else {
+				// not ours, don't respond
+				res = 0;
+			}
+			break;
+		}
+		break;
+	case PICC_ANTICOLL2:
+		switch(data[1]) {
+		case 0x20: // requested 4 bytes
+			if(gs_picc_uid_len > 7) {
+				data[i++] = 0x88;
+			}
+			else {
+				data[3] = picc_uid[6];
+			}
+			data[i++] = picc_uid[3];
+			data[i++] = picc_uid[4];
+			data[i++] = picc_uid[5];
+
+			data[4] = data[0] ^ data[1] ^ data[2] ^ data[3]; // Block Check Character
+			res = 5;
+			break;
+		case 0x70: // full frame
+			if((gs_picc_uid_len > 7) && (data[3] == picc_uid[3]) && (data[4] == picc_uid[4]) && (data[5] == picc_uid[5])) {
+				// acknowledge
+				data[0] = 0x04;
+				ISO14443AAppendCRCA(data, 1);
+				res = 3;
+			}
+			else if((data[2] == picc_uid[3]) && (data[3] == picc_uid[4]) && (data[4] == picc_uid[5]) && (data[5] == picc_uid[6])) {
+				// acknowledge
+				data[0] = 0x00;
+				ISO14443AAppendCRCA(data, 1);
+				res = 3;
+			}
+			else {
+				// not ours, don't respond
+				res = 0;
+			}
+			break;
+		}
+		break;
+	case PICC_ANTICOLL3:
+		switch(data[1]) {
+		case 0x20: // requested 4 bytes
+			data[0] = picc_uid[6];
+			data[1] = picc_uid[7];
+			data[2] = picc_uid[8];
+			data[3] = picc_uid[9];
+			data[4] = data[0] ^ data[1] ^ data[2] ^ data[3]; // Block Check Character
+			res = 5;
+			break;
+		case 0x70: // full frame
+			if((data[2] == picc_uid[6]) && (data[3] == picc_uid[7]) && (data[4] == picc_uid[8]) && (data[5] == picc_uid[9])) {
+				// acknowledge
+				data[0] = 0x00;
+				ISO14443AAppendCRCA(data, 1);
+				res = 3;
+			}
+			else {
+				// not ours, don't respond
+				res = 0;
+			}
+			break;
+		}
+		break;
+	case PICC_HALT: // Fall-through
+	default:
+		res = 0; // no response
+		break;
+	}
+
+	if(req_resp_debug) {
+		printf("resp (%d): [0x%02x", res, data[0]);
+		for(int i = 1; i < res; i++) {
+			printf(" 0x%02x", data[i]);
+		}
+		printf("]\n");
+	}
+
+	return res;
+}
+
 __INTERRUPT
 __HIGH_CODE
 void TMR0_IRQHandler(void) {
@@ -1165,7 +1335,7 @@ void TMR0_IRQHandler(void) {
 	while(gs_picc_last_processed_dma_idx != current_dma_idx) {
 		uint16_t value_from_dma = (uint16_t)gs_nfca_picc_signal_buf[gs_picc_last_processed_dma_idx];
 
-		// rise to rise timings are never below one et_u (128 ticks in our case) or more than 2 et_u (101)
+		// rise to rise timings are always 1, 1.5 or 2 et_u (128 ticks in our case)
 		if(TMR0_NFCA_PICC_IS_1ETU(value_from_dma) ||
 			TMR0_NFCA_PICC_IS_1_5ETU(value_from_dma) ||
 			TMR0_NFCA_PICC_IS_2ETU(value_from_dma)) {
@@ -1190,6 +1360,7 @@ void TMR0_IRQHandler(void) {
 			// SEL1 0x93, sum([192, 128, 192, 192, 192, ...]) = 896
 			// SEL2 0x95, sum([192, 256, 256, 192, 192, ...]) = 1088
 			// SEL3 0x97, sum([192, 128, 128, 256, 192, ...]) = 896
+			// READ 0x30, sum([128, 128, 128, 128, 192, ...]) = 704
 			pulse_sum += gs_nfca_data_buf[i];
 		}
 
@@ -1206,8 +1377,15 @@ void TMR0_IRQHandler(void) {
 				}
 				break;
 			case 7: // HALT 0x50, SEL1 0x93, SEL1 0x95, SEL1 0x97
-				if(PLUSMIN_7(pulse_sum, 704)) { // HALT
-					gs_picc_anticoll_cmd_guess = PICC_HALT;
+				if(PLUSMIN_7(pulse_sum, 704)) { // HALT or READ
+					switch(gs_nfca_data_buf[5] >> 3) {
+					case 256 >> 3:
+						gs_picc_anticoll_cmd_guess = PICC_HALT;
+						break;
+					case 128 >> 3:
+						gs_picc_anticoll_cmd_guess = PICC_READ;
+						break;
+					}
 				}
 				else if(PLUSMIN_7(pulse_sum, 896) || // SEL1,3
 						PLUSMIN_7(pulse_sum, 1088)) { // SEL2
@@ -1232,6 +1410,8 @@ void TMR0_IRQHandler(void) {
 			int req_len = decode_pulses_to_bits(gs_nfca_data_buf, /*len=*/gs_picc_data_idx, gs_picc_req_resp);
 			uint8_t cmd = 0;
 			uint8_t frame_len = 0;
+			uint8_t resp_len = 0;
+			uint8_t preptime = 0;
 
 			if(req_len > 0) {
 				switch(gs_picc_anticoll_cmd_guess) {
@@ -1242,8 +1422,8 @@ void TMR0_IRQHandler(void) {
 						gs_picc_state = PICC_STATE_SEND_RESP;
 
 						R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
-						gs_picc_req_resp[0] = 0x44;
-						gs_picc_req_resp[1] = 0x00;
+						gs_picc_req_resp[0] = ATQA[0];
+						gs_picc_req_resp[1] = ATQA[1];
 						wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD, gs_picc_req_resp, 2);
 				
 						R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
@@ -1262,10 +1442,30 @@ void TMR0_IRQHandler(void) {
 				case PICC_ANTICOLL1:
 				case PICC_ANTICOLL2:
 				case PICC_ANTICOLL3:
+				case PICC_READ:
 					frame_len = bits_to_frame(gs_picc_req_resp, req_len); // gs_picc_req_resp is reused as output
 					if(frame_len) {
 						if(gs_picc_req_resp[0] == gs_picc_anticoll_cmd_guess) {
-							printf("frame (%d): %02x %02x ...\n", frame_len, gs_picc_req_resp[0], gs_picc_req_resp[1]);
+							if(gs_picc_anticoll_cmd_guess == PICC_READ) {
+								resp_len = wch_nfca_standard_frame_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
+							}
+							else {
+								resp_len = wch_nfca_anticoll_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
+							}
+
+							if(resp_len) {
+								gs_picc_state = PICC_STATE_SEND_RESP;
+
+								R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
+								preptime = (frame_len + resp_len) / 2; // !!! TWEAK THE TIMING HERE !!!
+								wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD -preptime, gs_picc_req_resp, resp_len);
+						
+								R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
+								R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
+						
+								// Start the timer, which starts the whole DMA-driven transmission process
+								R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
+							}
 						}
 						else {
 							gs_picc_anticoll_cmd_guess = 0;
@@ -1292,9 +1492,9 @@ __HIGH_CODE
 void TMR3_IRQHandler(void) {
 	R8_TMR3_INT_FLAG = R8_TMR3_INT_FLAG; // Acknowledge
 
-	gs_picc_state = PICC_STATE_FREE;
 	R8_TMR3_CTRL_DMA = 0;
 	R8_TMR3_INTER_EN = 0;
+	gs_picc_state = PICC_STATE_FREE;
 
 	NVIC_ClearPendingIRQ(TMR3_IRQn);
 }
@@ -1311,12 +1511,59 @@ int main() {
 	blink(5);
 	
 	nfca_init();
-	// nfca_pcd_lpcd_calibration();
-	// nfca_pcd_test(); // handles nfca_pcd_start() and _stop()
 
+#ifdef CLONE_ULTRALIGHT
+	nfca_pcd_lpcd_calibration();
+	nfca_pcd_test(); // handles nfca_pcd_start() and _stop()
+#else
+	uint8_t ultralight_ID[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
+	memcpy(picc_uid, ultralight_ID, sizeof(ultralight_ID));
+#endif
+	
+	uint8_t ultralight_ATQA[] = {0x44, 0x00};
+	memcpy(ATQA, ultralight_ATQA, sizeof(ultralight_ATQA));
+	
 	printf("* Emulating Ultralight with uid %02x %02x %02x %02x %02x %02x %02x\n",
 			picc_uid[0], picc_uid[1], picc_uid[2], picc_uid[3], picc_uid[4], picc_uid[5], picc_uid[6]);
+	gs_picc_uid_len = 7;
 
+	int i = 0;
+	// [ID0, ID1, ID2, BCC1]
+	picc_ultralight_pages[i++] = picc_uid[0];
+	picc_ultralight_pages[i++] = picc_uid[1];
+	picc_ultralight_pages[i++] = picc_uid[2];
+	picc_ultralight_pages[i++] = (0x88 ^ picc_uid[0] ^ picc_uid[1] ^ picc_uid[2]); // ultralight uid is 7-bit
+
+	// [ID3, ID4, ID5, ID6]]
+	picc_ultralight_pages[i++] = picc_uid[3];
+	picc_ultralight_pages[i++] = picc_uid[4];
+	picc_ultralight_pages[i++] = picc_uid[5];
+	picc_ultralight_pages[i++] = picc_uid[6];
+
+	// [BCC2, 0x48, Lock0, Lock1] (0x48 is Internal/Manufacturer data)
+	picc_ultralight_pages[i++] = (picc_uid[0] ^ picc_uid[0] ^ picc_uid[0] ^ picc_uid[0]);
+	picc_ultralight_pages[i++] = 0x48;
+	picc_ultralight_pages[i++] = 0x00; // 0x00: writable
+	picc_ultralight_pages[i++] = 0x00; // 0x00: writable
+
+	// [OTP0, OTP1, OTP2, OTP3] (One Time Programmable bytes).
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+
+	// User memory
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+
+	// User memory
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	picc_ultralight_pages[i++] = 0x00;
+	
 	nfca_picc_start();
 
 	while(1);
