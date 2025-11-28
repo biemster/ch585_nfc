@@ -1039,14 +1039,16 @@ static inline uint8_t bits_to_byte(uint8_t bit_str[]) {
 static inline uint8_t bits_to_frame(uint8_t bit_str[], int len) {
 	// this is reusing (overwriting!) the input bit string!
 	uint8_t num_bytes = 0;
-	if(bit_str[0] != '0' || bit_str[len -1] != '0') {
-		// printf("* ERROR in bits_to_frame: SOF/EOF not zero\n");
+	int has_eof = (bit_str[len -1] == '0') ? 1 : 0;
+
+	if(bit_str[0] != '0') {
+		// printf("* ERROR in bits_to_frame: SOF not zero\n");
 	}
-	else if((len -2) % 9) { // frame len is 9 bits per byte, + SOF,EOF
+	else if((len -1 -has_eof) % 9) { // frame len is 9 bits per byte, + SOF,EOF
 		// printf("* ERROR in bits_to_frame: bit string is incomplete\n");
 	}
 	else {
-		for(int i = 1; i < (len -1); i += 9) {
+		for(int i = 1; i < (len -has_eof); i += 9) {
 			if(check_parity(&bit_str[i])) {
 				bit_str[num_bytes++] = bits_to_byte(&bit_str[i]);
 			}
