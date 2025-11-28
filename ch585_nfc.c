@@ -1156,7 +1156,7 @@ void wch_nfca_picc_prepare_tx_dma(int silence, uint8_t *data, uint8_t num_bytes)
 	// Encode the data into the DMA buffer format
 	uint16_t dma_len = nfca_manchester_encode(silence, data, num_bytes);
 	R32_TMR3_DMA_BEG = (uint32_t)gs_nfca_picc_tx_buf;
-	R32_TMR3_DMA_END = (uint32_t)&gs_nfca_picc_tx_buf[dma_len +1];
+	R32_TMR3_DMA_END = (uint32_t)&gs_nfca_picc_tx_buf[dma_len];
 }
 
 __HIGH_CODE
