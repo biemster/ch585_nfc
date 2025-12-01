@@ -221,6 +221,7 @@ void blink(int n) {
 		if(i) Delay_Ms(33);
 	}
 }
+static volatile int gs_debug_blink; // to .sbss, which is initialized to 0
 
 __INTERRUPT
 __HIGH_CODE
@@ -1181,6 +1182,7 @@ int wch_nfca_standard_frame_response(uint8_t *data, uint8_t num_bytes, int req_r
 		for(int i = 0; i < 16; i++) {
 			data[i] = picc_ultralight_pages[i +page_start];
 			ISO14443AAppendCRCA(data, 16);
+			res = 18;
 		}
 		break;
 	default:
@@ -1414,6 +1416,7 @@ void TMR0_IRQHandler(void) {
 			uint8_t frame_len = 0;
 			uint8_t resp_len = 0;
 			uint8_t preptime = 0;
+			uint16_t crc = 0;
 
 			if(req_len > 0) {
 				switch(gs_picc_anticoll_cmd_guess) {
@@ -1421,6 +1424,7 @@ void TMR0_IRQHandler(void) {
 				case PICC_WUPA:
 					cmd = bits_to_byte(gs_picc_req_resp) >> 1; // >> 1 to discard EOF 0 last bit
 					if(cmd == gs_picc_anticoll_cmd_guess) {
+						// gs_debug_blink = 1;
 						gs_picc_state = PICC_STATE_SEND_RESP;
 
 						R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
@@ -1448,25 +1452,30 @@ void TMR0_IRQHandler(void) {
 					frame_len = bits_to_frame(gs_picc_req_resp, req_len); // gs_picc_req_resp is reused as output
 					if(frame_len) {
 						if(gs_picc_req_resp[0] == gs_picc_anticoll_cmd_guess) {
-							if(gs_picc_anticoll_cmd_guess == PICC_READ) {
-								resp_len = wch_nfca_standard_frame_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
-							}
-							else {
-								resp_len = wch_nfca_anticoll_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
-							}
+							crc = ISO14443_CRCA(gs_picc_req_resp, frame_len -2);
+							if(((frame_len == 2) && (gs_picc_req_resp[1] == 0x20)) ||
+									((crc >> 8 == gs_picc_req_resp[frame_len -1]) && ((crc & 0xff) == gs_picc_req_resp[frame_len -2]))) {
 
-							if(resp_len) {
-								gs_picc_state = PICC_STATE_SEND_RESP;
+								if(gs_picc_anticoll_cmd_guess == PICC_READ) {
+									resp_len = wch_nfca_standard_frame_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
+								}
+								else {
+									resp_len = wch_nfca_anticoll_response(gs_picc_req_resp, frame_len, /*debug print=*/0);
+								}
 
-								R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
-								preptime = (frame_len + resp_len) / 2; // !!! TWEAK THE TIMING HERE !!!
-								wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD -preptime, gs_picc_req_resp, resp_len);
-						
-								R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
-								R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
-						
-								// Start the timer, which starts the whole DMA-driven transmission process
-								R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
+								if(resp_len) {
+									gs_picc_state = PICC_STATE_SEND_RESP;
+
+									R32_TMR3_FIFO = TMR3_CTRL_PWM_OFF;
+									preptime = (frame_len + resp_len); // !!! TWEAK THE TIMING HERE !!!
+									wch_nfca_picc_prepare_tx_dma(/*silence=*/TMR3_NFCA_PICC_FTD -preptime, gs_picc_req_resp, resp_len);
+
+									R8_TMR3_INT_FLAG = RB_TMR_IF_DMA_END; // clear flag
+									R8_TMR3_INTER_EN = RB_TMR_IE_DMA_END;
+
+									// Start the timer, which starts the whole DMA-driven transmission process
+									R8_TMR3_CTRL_DMA = RB_TMR_DMA_ENABLE;
+								}
 							}
 						}
 						else {
@@ -1486,7 +1495,9 @@ void TMR0_IRQHandler(void) {
 		}
 	}
 
-	NVIC_ClearPendingIRQ(TMR0_IRQn);
+	if(gs_picc_state == PICC_STATE_SEND_RESP) {
+		NVIC_ClearPendingIRQ(TMR0_IRQn);
+	}
 }
 
 __INTERRUPT
@@ -1568,5 +1579,10 @@ int main() {
 	
 	nfca_picc_start();
 
-	while(1);
+	while(1) {
+		if(gs_debug_blink) {
+			blink(gs_debug_blink);
+			gs_debug_blink = 0;
+		}
+	}
 }
