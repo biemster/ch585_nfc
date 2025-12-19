@@ -729,6 +729,7 @@ void nfca_picc_start() {
 }
 
 // ISO 14443-3A functions
+__HIGH_CODE
 uint16_t ISO14443_CRCA(uint8_t *buf, uint8_t len) {
 	uint8_t *data = buf;
 	uint16_t crc = 0x6363;
@@ -832,7 +833,7 @@ uint16_t PcdAnticoll(uint8_t cmd) {
 	g_nfca_pcd_send_buf[1] = 0x20;
 
 	nfca_pcd_wait_ms(PCD_ANTICOLL_OVER_TIME);
-	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_parity_buf, 2);
+	ISO14443ACalOddParityBit(g_nfca_pcd_send_buf, g_nfca_parity_buf, 2);
 
 	if (nfca_pcd_comm(16, NFCA_PCD_REC_MODE_NORMAL, 0) == 0) {
 		status = nfca_pcd_wait_comm_end();
@@ -867,13 +868,13 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr) {
 	g_nfca_pcd_send_buf[1] = 0x70;
 	g_nfca_pcd_send_buf[6] = 0;
 	nfca_pcd_wait_ms(PCD_SELECT_OVER_TIME);
-	for (res = 0; res < 4; res++) {
-		g_nfca_pcd_send_buf[res + 2] = *(pSnr + res);
-		g_nfca_pcd_send_buf[6] ^= *(pSnr + res);
+	for(int i = 0; i < 4; i++) {
+		g_nfca_pcd_send_buf[i + 2] = *(pSnr + i);
+		g_nfca_pcd_send_buf[6] ^= *(pSnr + i);
 	}
-	ISO14443AAppendCRCA((uint8_t *)g_nfca_pcd_send_buf, 7);
+	ISO14443AAppendCRCA(g_nfca_pcd_send_buf, 7);
 
-	ISO14443ACalOddParityBit((uint8_t *)g_nfca_pcd_send_buf, (uint8_t *)g_nfca_parity_buf, 9);
+	ISO14443ACalOddParityBit(g_nfca_pcd_send_buf, g_nfca_parity_buf, 9);
 
 	if (nfca_pcd_comm(9 * 8, NFCA_PCD_REC_MODE_NORMAL, 0) == 0) {
 		status = nfca_pcd_wait_comm_end();
@@ -881,7 +882,7 @@ uint16_t PcdSelect(uint8_t cmd, uint8_t *pSnr) {
 		if(status == NFCA_PCD_CONTROLLER_STATE_DONE) {
 			if (g_nfca_pcd_recv_bits == (3 * 9)) {
 				if (ISO14443ACheckOddParityBit(g_nfca_pcd_recv_buf, g_nfca_parity_buf, 3)) {
-					if (ISO14443_CRCA((uint8_t *)g_nfca_pcd_recv_buf, 3) == 0) {
+					if (ISO14443_CRCA(g_nfca_pcd_recv_buf, 3) == 0) {
 						// g_m1_crypto1_cipher.is_encrypted = 0;
 						res = PCD_NO_ERROR;
 					}
@@ -1525,6 +1526,7 @@ int main() {
 	
 	nfca_init();
 
+#define CLONE_ULTRALIGHT
 #ifdef CLONE_ULTRALIGHT
 	nfca_pcd_lpcd_calibration();
 	nfca_pcd_test(); // handles nfca_pcd_start() and _stop()
